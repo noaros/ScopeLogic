@@ -6,7 +6,7 @@
 
 **Goal:** build and flash register-level C from the command line, and see it on the logic analyzer.
 
-1. Install the tools: `sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils openocd`
+1. Install the tools: `sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils`, plus STM32CubeProgrammer (provides `STM32_Programmer_CLI` for flashing)
 2. Copy the register-definition headers (no HAL) into `firmware/vendor/`:
    - From [cmsis_device_f4](https://github.com/STMicroelectronics/cmsis_device_f4) `Include/`: `stm32f4xx.h`, `stm32f429xx.h`, `system_stm32f4xx.h`
    - From [CMSIS_5](https://github.com/ARM-software/CMSIS_5) `CMSIS/Core/Include/`: `core_cm4.h`, `cmsis_compiler.h`, `cmsis_gcc.h`, `cmsis_version.h`, `mpu_armv7.h`
@@ -25,7 +25,7 @@
    	arm-none-eabi-size $@
 
    flash: build/fw.elf
-   	openocd -f board/st_nucleo_f4.cfg -c "program $< verify reset exit"
+   	STM32_Programmer_CLI -c port=SWD -w $< -v -rst
 
    clean:
    	rm -rf build
