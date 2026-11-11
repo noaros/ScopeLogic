@@ -52,3 +52,42 @@
 5. Flash: `STM32_Programmer_CLI -c port=SWD -w build/fw.elf -v -rst`
 
 **Done when:** LD1 goes from off (substep 1) to on after flashing, and lights again after unplugging and replugging USB, which shows the program is stored in flash.
+
+## Step 3 — See a pin toggle on the logic analyzer
+
+**Goal:** drive a pin up and down as fast as a simple loop can, and capture it on the LA1010. This is the timing-marker technique the benchmarks will use. The pin is PF15, which comes out on the header socket labelled D2 and has nothing else connected to it.
+
+1. Wire the LA1010: CH0 to the **D2** socket (PF15), and the LA's GND to a **GND** pin on the Nucleo.
+2. Get a "before" capture: with the Step 2 program still on the board, capture about 1 ms in KingstVIS at 50 MS/s or faster. CH0 should show **no repeating pulses**.
+3. Change `firmware/main.c` to keep LD1 on as a "program is running" light, and toggle PF15 forever:
+   ```c
+   #include <stdint.h>
+
+   #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
+   #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
+   #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
+   #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+   #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+
+   void Reset_Handler(void)
+   {
+       RCC_AHB1ENR |= (1u << 1) | (1u << 5);         /* turn on GPIOB and GPIOF clocks */
+       (void)RCC_AHB1ENR;                            /* wait for them to take effect */
+       GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;       /* PB0 = output */
+       GPIOB_BSRR  = 1u << 0;                        /* LD1 on: program is running */
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);  /* PF15 = output */
+
+       for (;;) {
+           GPIOF_BSRR = 1u << 15;                    /* PF15 high */
+           GPIOF_BSRR = 1u << (15 + 16);             /* PF15 low */
+       }
+   }
+
+   /* The two words the CPU reads at reset: initial stack pointer, reset address. */
+   __attribute__((section(".isr_vector"), used))
+   void *const vectors[2] = { (void *)0x20030000, Reset_Handler };
+   ```
+4. Build and flash, with the same commands as Step 2 (substeps 4 and 5).
+5. Capture again, with the same settings as substep 2.
+
+**Done when:** LD1 is on, and CH0 shows a steady repeating pulse train that wasn't there in substep 2. Write down its frequency, and how long it stays high and low: that's your first timing measurement.
