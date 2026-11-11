@@ -15,7 +15,8 @@
 
 **Goal:** build the smallest possible bare-metal program, flash it, and see it run. It turns on the green user LED (LD1, wired to pin PB0).
 
-1. `firmware/stm32f429zi.ld`: tell the linker where flash and RAM are, and put the vector table at the start of flash:
+1. Start from a known state: erase the flash with `STM32_Programmer_CLI -c port=SWD mode=UR -e all`, then check that LD1 (the green LED labelled LD1 on the board) is **off**. With the flash erased the chip runs nothing, so nothing drives PB0.
+2. `firmware/stm32f429zi.ld`: tell the linker where flash and RAM are, and put the vector table at the start of flash:
    ```ld
    MEMORY {
      FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 2048K
@@ -26,7 +27,7 @@
      .text       : { *(.text*) *(.rodata*) } > FLASH
    }
    ```
-2. `firmware/main.c`: write the registers directly by address (from the reference manual, RM0090):
+3. `firmware/main.c`: write the registers directly by address (from the reference manual, RM0090):
    ```c
    #include <stdint.h>
 
@@ -47,7 +48,7 @@
    __attribute__((section(".isr_vector"), used))
    void *const vectors[2] = { (void *)0x20030000, Reset_Handler };
    ```
-3. Build, from `firmware/`: `mkdir -p build && arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -Wall -nostdlib -T stm32f429zi.ld main.c -o build/fw.elf`
-4. Flash: `STM32_Programmer_CLI -c port=SWD -w build/fw.elf -v -rst`
+4. Build, from `firmware/`: `mkdir -p build && arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -Wall -nostdlib -T stm32f429zi.ld main.c -o build/fw.elf`
+5. Flash: `STM32_Programmer_CLI -c port=SWD -w build/fw.elf -v -rst`
 
-**Done when:** LD1 (green) lights up after flashing, and lights again after unplugging and replugging USB, which shows the program is stored in flash.
+**Done when:** LD1 goes from off (substep 1) to on after flashing, and lights again after unplugging and replugging USB, which shows the program is stored in flash.
