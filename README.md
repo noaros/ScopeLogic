@@ -94,3 +94,80 @@
 
 **Measured (16 MHz HSI, KingstVIS at 50 MS/s):** 1.25 MHz, about 380 ns high and 420 ns low (800 ns period, about 13 CPU cycles). Single widths vary by ±20 ns because that's one 20 ns sample step; the low part is longer because the jump back to the top of the loop happens while the pin is low.
 <img width="2214" height="632" alt="image" src="https://github.com/user-attachments/assets/fb94bea7-70d3-46c1-9830-4de7ba4849a4" />
+
+## Step 4 — Run the CPU at 144 MHz
+
+**Goal:** switch from the 16 MHz internal clock (HSI) to 144 MHz from the PLL, fed by the 8 MHz clock the ST-LINK supplies (HSE bypass, the board's default wiring per UM1974 §7.8.1). 144 MHz is chosen for the ADC, not the CPU: it makes APB2 72 MHz, so the ADC clock can later run at its 36 MHz maximum (2.4 MSPS). 180 MHz would cap the ADC at 22.5 MHz. To prove the new speed, the chip also outputs its clock ÷ 5 on pin PC9 (MCO2) for the scope.
+
+1. Wire the scope: probe tip to **CN8 pin 4** (D44, PC9), ground clip to **CN8 pin 11 or 13** (GND). CN8 is the upper header on the left side. Use the probe's ×10 setting and keep the ground lead short. Leave the LA1010 on D2 (PF15) from Step 3.
+2. Get "before" readings with the Step 3 program still on the board:
+   - Scope on PC9: **flat**, because nothing drives PC9 yet.
+   - LA1010 on PF15: about **1.25 MHz**, as in Step 3.
+3. Change `firmware/main.c` to set up the clock output, then switch the clock, then turn LD1 on and toggle PF15 as before. LD1 now only comes on once the switch has finished, so if it stays off, the program is stuck waiting in one of the `while` loops.
+   ```c
+   #include <stdint.h>
+   
+   #define RCC_CR      (*(volatile uint32_t *)0x40023800)
+   #define RCC_PLLCFGR (*(volatile uint32_t *)0x40023804)
+   #define RCC_CFGR    (*(volatile uint32_t *)0x40023808)
+   #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
+   #define FLASH_ACR   (*(volatile uint32_t *)0x40023C00)
+   #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
+   #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
+   #define GPIOC_MODER   (*(volatile uint32_t *)0x40020800)
+   #define GPIOC_OSPEEDR (*(volatile uint32_t *)0x40020808)
+   #define GPIOC_AFRH    (*(volatile uint32_t *)0x40020824)
+   #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+   #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+   
+   void Reset_Handler(void)
+   {
+       RCC_AHB1ENR |= (1u << 1) | (1u << 2) | (1u << 5);  /* GPIOB, GPIOC, GPIOF clocks */
+       (void)RCC_AHB1ENR;
+   
+       /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
+       RCC_CFGR = (RCC_CFGR & ~(0x1Fu << 27)) | (7u << 27);   /* MCO2 = SYSCLK (00), MCO2PRE = /5 (111) */
+       GPIOC_AFRH    &= ~(0xFu << 4);                          /* PC9 alternate function 0 = MCO2 */
+       GPIOC_OSPEEDR |= 3u << 18;                              /* PC9 very high speed */
+       GPIOC_MODER    = (GPIOC_MODER & ~(3u << 18)) | (2u << 18);  /* PC9 = alternate function */
+   
+       /* 1. HSE: the 8 MHz clock from the ST-LINK, fed in directly (bypass) */
+       RCC_CR |= 1u << 18;                                     /* HSEBYP */
+       RCC_CR |= 1u << 16;                                     /* HSEON */
+       while (!(RCC_CR & (1u << 17))) {}                       /* wait for HSERDY */
+   
+       /* 2. PLL: 8 MHz / M=4 = 2 MHz, x N=144 = 288 MHz, / P=2 = 144 MHz (Q=6 gives 48 MHz) */
+       RCC_PLLCFGR = (RCC_PLLCFGR & ~0x0F43FFFFu)
+                   | (4u << 0) | (144u << 6) | (0u << 16) | (1u << 22) | (6u << 24);
+       RCC_CR |= 1u << 24;                                     /* PLLON */
+       while (!(RCC_CR & (1u << 25))) {}                       /* wait for PLLRDY */
+   
+       /* 3. Flash: 4 wait states for 144 MHz at 3.3 V, plus prefetch, instruction and data caches */
+       FLASH_ACR = 4u | (1u << 8) | (1u << 9) | (1u << 10);
+       while ((FLASH_ACR & 0xFu) != 4u) {}
+   
+       /* 4. Bus dividers: AHB /1 (144), APB1 /4 (36), APB2 /2 (72) */
+       RCC_CFGR = (RCC_CFGR & ~0xFCF0u) | (5u << 10) | (4u << 13);
+   
+       /* 5. Switch the system clock to the PLL */
+       RCC_CFGR = (RCC_CFGR & ~3u) | 2u;
+       while (((RCC_CFGR >> 2) & 3u) != 2u) {}                 /* wait until SWS reports PLL */
+   
+       GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;
+       GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
+   
+       for (;;) {
+           GPIOF_BSRR = 1u << 15;
+           GPIOF_BSRR = 1u << (15 + 16);
+       }
+   }
+   
+   __attribute__((section(".isr_vector"), used))
+   void *const vectors[2] = { (void *)0x20030000, Reset_Handler };
+   ```
+   Register notes (RM0090): the power controller's voltage scale is already Scale 1 at reset, which allows up to 168 MHz, so over-drive isn't needed. Flash needs 4 wait states between 120 and 150 MHz at 3.3 V, and must be set before the clock goes up. The bus dividers are also set before the switch so APB1 and APB2 never exceed their limits (45 and 90 MHz).
+4. Build and flash, with the same commands as Step 2 (substeps 4 and 5). If the programmer can't connect afterwards, add `mode=UR` to the flash command.
+5. Measure again: the scope on PC9, and the LA1010 on PF15 at its highest sample rate (100 MS/s with 3 or fewer channels enabled).
+
+**Done when:** LD1 is on, the scope shows about **28.8 MHz** on PC9 (144 MHz ÷ 5) where it was flat before, and the PF15 toggle is about **9× faster** than 1.25 MHz. Write down both frequencies. The scope number checks the clock directly; the toggle number shows what the loop actually costs at the new speed, which won't be exactly 9× because flash wait states and the cache change the cycle count.
