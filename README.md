@@ -371,3 +371,207 @@
 - **The edge lateness depends on how often the wait loop checks the counter**: about every 6 instructions here. That's the same kind of jitter software-started ADC sampling will have in the benchmarks.
 - **`mode=HOTPLUG` reads memory over SWD while the program keeps running**: a way to look at variables without UART or a debugger session.
 - **A frequency read from one period inherits the analyzer's step:** 10 ns in 20 µs is 0.05%, so 49.975 kHz instead of 50.000.
+
+## Step 6 — Startup code, global variables and a Makefile
+
+**Goal:** make global variables work, give the CPU a proper vector table, and build with `make`. So far the firmware has had no startup code (`-nostdlib`), so nothing set globals to their starting values: C promises that `uint32_t count;` starts at 0 and `uint32_t period = 1440;` starts at 1440, but on this board both would start with whatever was in RAM. Every later step needs globals (sample buffers, counters, flags shared with interrupts) and interrupt handlers. On the board nothing visible changes: PF15 stays at 50 kHz. What's new is that it now comes from a global variable, which you also read back over SWD.
+
+1. Wiring: same as Step 5 (LA1010 CH0 on D2 / PF15, CN10 pin 12; GND on CN10 pin 17).
+2. `firmware/stm32f429zi.ld`: add a `.data` section (in RAM, with its starting values stored in flash) and a `.bss` section (in RAM, zeroed), and export the addresses the startup code needs:
+   ```ld
+   ENTRY(Reset_Handler)
+   
+   MEMORY {
+     FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 2048K
+     RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 192K
+   }
+   
+   _estack = ORIGIN(RAM) + LENGTH(RAM);        /* 0x20030000: the stack starts at the top of RAM */
+   
+   SECTIONS {
+     .isr_vector : { KEEP(*(.isr_vector)) } > FLASH
+     .text       : { *(.text*) *(.rodata*) . = ALIGN(4); } > FLASH
+   
+     /* Initialized globals: live in RAM, but their starting values are stored in flash */
+     .data : {
+       _sdata = .;
+       *(.data*)
+       . = ALIGN(4);
+       _edata = .;
+     } > RAM AT > FLASH
+     _sidata = LOADADDR(.data);                /* where in flash the starting values are */
+   
+     /* Zero-initialized globals: live in RAM, nothing stored in flash */
+     .bss (NOLOAD) : {
+       _sbss = .;
+       *(.bss*) *(COMMON)
+       . = ALIGN(4);
+       _ebss = .;
+     } > RAM
+   }
+   ```
+   `AT > FLASH` is what puts `.data`'s starting values in flash while its addresses point at RAM. `ENTRY(Reset_Handler)` tells the tools where the program starts.
+3. `firmware/startup.c` (new): `Reset_Handler` moves here, does the RAM setup, then calls `main()`. The vector table grows to the 16 Cortex-M4 entries:
+   ```c
+   #include <stdint.h>
+   
+   /* Defined by the linker script */
+   extern uint32_t _estack, _sidata, _sdata, _edata, _sbss, _ebss;
+   
+   int main(void);
+   
+   /* Runs first after every reset: set up RAM the way C expects, then call main() */
+   void Reset_Handler(void)
+   {
+       uint32_t *src = &_sidata;
+       uint32_t *dst = &_sdata;
+       while (dst < &_edata) *dst++ = *src++;      /* .data: copy starting values from flash */
+   
+       for (dst = &_sbss; dst < &_ebss; ) *dst++ = 0;  /* .bss: zero */
+   
+       main();
+       for (;;) {}                                 /* main() should never return */
+   }
+   
+   /* Any fault or interrupt without its own handler ends up here. In a debugger,
+      a program stuck in Default_Handler means something went wrong. */
+   void Default_Handler(void) { for (;;) {} }
+   
+   /* "weak": a later step can define e.g. SysTick_Handler() in another file and it replaces this */
+   void NMI_Handler(void)        __attribute__((weak, alias("Default_Handler")));
+   void HardFault_Handler(void)  __attribute__((weak, alias("Default_Handler")));
+   void MemManage_Handler(void)  __attribute__((weak, alias("Default_Handler")));
+   void BusFault_Handler(void)   __attribute__((weak, alias("Default_Handler")));
+   void UsageFault_Handler(void) __attribute__((weak, alias("Default_Handler")));
+   void SVC_Handler(void)        __attribute__((weak, alias("Default_Handler")));
+   void DebugMon_Handler(void)   __attribute__((weak, alias("Default_Handler")));
+   void PendSV_Handler(void)     __attribute__((weak, alias("Default_Handler")));
+   void SysTick_Handler(void)    __attribute__((weak, alias("Default_Handler")));
+   
+   /* The 16 Cortex-M4 entries. Peripheral interrupts (timer, ADC, DMA) get added in the steps that use them. */
+   __attribute__((section(".isr_vector"), used))
+   void (*const vectors[16])(void) = {
+       (void (*)(void))&_estack,   /*  0: initial stack pointer */
+       Reset_Handler,              /*  1 */
+       NMI_Handler,                /*  2 */
+       HardFault_Handler,          /*  3 */
+       MemManage_Handler,          /*  4 */
+       BusFault_Handler,           /*  5 */
+       UsageFault_Handler,         /*  6 */
+       0, 0, 0, 0,                 /*  7-10: reserved */
+       SVC_Handler,                /* 11 */
+       DebugMon_Handler,           /* 12 */
+       0,                          /* 13: reserved */
+       PendSV_Handler,             /* 14 */
+       SysTick_Handler,            /* 15 */
+   };
+   ```
+   Any fault (for example a bad memory access) now ends in `Default_Handler` instead of jumping to a random address. The handlers are `weak`, so a later step can write its own `SysTick_Handler()` in another file and it replaces the default one.
+4. `firmware/main.c`: three changes from Step 5. `Reset_Handler` becomes `main`, the `PERIOD` constant becomes a global `period` (in `.data`) and a new global `toggles` (in `.bss`) counts flips, and the vector table moves out to `startup.c`:
+   ```c
+   #include <stdint.h>
+   
+   #define RCC_CR      (*(volatile uint32_t *)0x40023800)
+   #define RCC_PLLCFGR (*(volatile uint32_t *)0x40023804)
+   #define RCC_CFGR    (*(volatile uint32_t *)0x40023808)
+   #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
+   #define FLASH_ACR   (*(volatile uint32_t *)0x40023C00)
+   #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
+   #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
+   #define GPIOC_MODER   (*(volatile uint32_t *)0x40020800)
+   #define GPIOC_OSPEEDR (*(volatile uint32_t *)0x40020808)
+   #define GPIOC_AFRH    (*(volatile uint32_t *)0x40020824)
+   #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+   #define GPIOF_ODR   (*(volatile uint32_t *)0x40021414)
+   #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+   #define DEMCR       (*(volatile uint32_t *)0xE000EDFC)
+   #define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
+   #define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
+   
+   /* Globals: the startup code sets these up before main() runs */
+   uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
+   uint32_t toggles;                                       /* .bss: starts at 0 */
+   
+   int main(void)
+   {
+       RCC_AHB1ENR |= (1u << 1) | (1u << 2) | (1u << 5);  /* GPIOB, GPIOC, GPIOF clocks */
+       (void)RCC_AHB1ENR;
+   
+       /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
+       RCC_CFGR = (RCC_CFGR & ~(0x1Fu << 27)) | (7u << 27);   /* MCO2 = SYSCLK (00), MCO2PRE = /5 (111) */
+       GPIOC_AFRH    &= ~(0xFu << 4);                          /* PC9 alternate function 0 = MCO2 */
+       GPIOC_OSPEEDR |= 3u << 18;                              /* PC9 very high speed */
+       GPIOC_MODER    = (GPIOC_MODER & ~(3u << 18)) | (2u << 18);  /* PC9 = alternate function */
+   
+       /* 1. HSE: the 8 MHz clock from the ST-LINK, fed in directly (bypass) */
+       RCC_CR |= 1u << 18;                                     /* HSEBYP */
+       RCC_CR |= 1u << 16;                                     /* HSEON */
+       while (!(RCC_CR & (1u << 17))) {}                       /* wait for HSERDY */
+   
+       /* 2. PLL: 8 MHz / M=4 = 2 MHz, x N=144 = 288 MHz, / P=2 = 144 MHz (Q=6 gives 48 MHz) */
+       RCC_PLLCFGR = (RCC_PLLCFGR & ~0x0F43FFFFu)
+                   | (4u << 0) | (144u << 6) | (0u << 16) | (1u << 22) | (6u << 24);
+       RCC_CR |= 1u << 24;                                     /* PLLON */
+       while (!(RCC_CR & (1u << 25))) {}                       /* wait for PLLRDY */
+   
+       /* 3. Flash: 4 wait states for 144 MHz at 3.3 V, plus prefetch, instruction and data caches */
+       FLASH_ACR = 4u | (1u << 8) | (1u << 9) | (1u << 10);
+       while ((FLASH_ACR & 0xFu) != 4u) {}
+   
+       /* 4. Bus dividers: AHB /1 (144), APB1 /4 (36), APB2 /2 (72) */
+       RCC_CFGR = (RCC_CFGR & ~0xFCF0u) | (5u << 10) | (4u << 13);
+   
+       /* 5. Switch the system clock to the PLL */
+       RCC_CFGR = (RCC_CFGR & ~3u) | 2u;
+       while (((RCC_CFGR >> 2) & 3u) != 2u) {}                 /* wait until SWS reports PLL */
+   
+       GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;
+       GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
+   
+       /* Cycle counter: counts every CPU clock (144 MHz) */
+       DEMCR     |= 1u << 24;                              /* TRCENA: turn on the debug/trace block */
+       DWT_CYCCNT = 0;
+       DWT_CTRL  |= 1u << 0;                               /* CYCCNTENA: start counting */
+   
+       uint32_t next = DWT_CYCCNT;
+       for (;;) {
+           next += period;                                 /* next deadline, from the last one, not from now */
+           while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
+           GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
+           toggles++;
+       }
+   }
+   ```
+5. `firmware/Makefile` (new). It uses the same compiler flags as before, plus `-g` (debug info: it doesn't change the code). Recipe lines must start with a **tab**, not spaces:
+   ```make
+   CC      = arm-none-eabi-gcc
+   CFLAGS  = -mcpu=cortex-m4 -mthumb -Wall -g
+   LDFLAGS = -nostdlib -T stm32f429zi.ld
+   SRCS    = startup.c main.c
+   
+   build/fw.elf: $(SRCS) stm32f429zi.ld Makefile
+   	mkdir -p build
+   	$(CC) $(CFLAGS) $(LDFLAGS) $(SRCS) -o $@
+   	arm-none-eabi-size $@
+   
+   flash: build/fw.elf
+   	STM32_Programmer_CLI -c port=SWD -w $< -v -rst
+   
+   clean:
+   	rm -rf build
+   
+   .PHONY: flash clean
+   ```
+   Optimization stays off for now. Turning it on (`-O2`) changes the loop timing and is worth trying as its own change later.
+6. From `firmware/`: `make`, then `make flash`. `make` should report `data 4` and `bss 4`: those are `period` and `toggles`.
+7. Find where the linker put the two globals: `arm-none-eabi-nm build/fw.elf | grep -E "period|toggles"`. Expect `20000000 D period` and `20000004 B toggles` (`D` = `.data`, `B` = `.bss`).
+8. Unplug and replug the Nucleo's USB. RAM keeps its contents through a reset, but not through a power cycle, so this makes sure `period` really came from the startup code and not from the previous program.
+9. Read both globals over SWD while the board runs, twice:
+   ```
+   STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32 0x20000000 2
+   ```
+   The first word is `period`, the second is `toggles`.
+10. Measure PF15 on the LA1010 as in Step 5 (100 MS/s, 1 MSa).
+
+**Done when:** `make` and `make flash` work; after the power cycle, `period` reads `0x000005A0` (1440); `toggles` goes up between the two reads at about **100,000 per second** (two flips per 20 µs period: about 4,500 for reads 45 ms apart); and PF15 is still a 50 kHz square wave with 10 µs high and low widths, as in Step 5. If `period` hadn't been copied, PF15 would run at some other rate: as fast as the loop can go if it were 0, or something odd if it were random.
