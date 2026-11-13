@@ -605,3 +605,142 @@
 - **RAM keeps its contents through a reset but not a power cycle,** so only a power cycle shows the startup code really did the copy.
 - **`STM32_Programmer_CLI -r32` takes its size in bytes**, not words: `8` reads two 32-bit values.
 - **`weak` handlers** let later steps add an interrupt handler just by writing a function with the right name, such as `SysTick_Handler`.
+
+## Step 7 — Send text to the PC over UART
+
+**Goal:** send a line of text from the board to the PC once a second, over the ST-LINK's USB serial port. Measurement data will leave the board this way, starting with the first ADC readings. Each line also reports how many cycles the previous line took to send, so the step measures the cost of sending too.
+
+No extra wiring: on the NUCLEO-F429ZI, USART3 (PD8 TX, PD9 RX) is connected to the ST-LINK's virtual serial port by default (UM1974), which shows up on the PC as `/dev/ttyACM0`. The LA1010 stays on D2 (PF15) as in Step 6.
+
+1. Change `firmware/main.c`: add the USART3 and GPIOD registers, three small send functions (there's no C library, so no `printf`), set up USART3 after the clock switch, and send a line every 100,000 flips. `startup.c`, the linker script and the Makefile are unchanged.
+   ```c
+   #include <stdint.h>
+   
+   #define RCC_CR      (*(volatile uint32_t *)0x40023800)
+   #define RCC_PLLCFGR (*(volatile uint32_t *)0x40023804)
+   #define RCC_CFGR    (*(volatile uint32_t *)0x40023808)
+   #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
+   #define RCC_APB1ENR (*(volatile uint32_t *)0x40023840)
+   #define FLASH_ACR   (*(volatile uint32_t *)0x40023C00)
+   #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
+   #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
+   #define GPIOC_MODER   (*(volatile uint32_t *)0x40020800)
+   #define GPIOC_OSPEEDR (*(volatile uint32_t *)0x40020808)
+   #define GPIOC_AFRH    (*(volatile uint32_t *)0x40020824)
+   #define GPIOD_MODER (*(volatile uint32_t *)0x40020C00)
+   #define GPIOD_AFRH  (*(volatile uint32_t *)0x40020C24)
+   #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+   #define GPIOF_ODR   (*(volatile uint32_t *)0x40021414)
+   #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+   #define DEMCR       (*(volatile uint32_t *)0xE000EDFC)
+   #define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
+   #define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
+   #define USART3_SR   (*(volatile uint32_t *)0x40004800)
+   #define USART3_DR   (*(volatile uint32_t *)0x40004804)
+   #define USART3_BRR  (*(volatile uint32_t *)0x40004808)
+   #define USART3_CR1  (*(volatile uint32_t *)0x4000480C)
+   
+   /* Globals: the startup code sets these up before main() runs */
+   uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
+   uint32_t toggles;                                       /* .bss: starts at 0 */
+   
+   /* Send one byte: wait until the transmitter can take it (TXE), then hand it over */
+   static void uart_putc(char c)
+   {
+       while (!(USART3_SR & (1u << 7))) {}                 /* TXE: transmit data register empty */
+       USART3_DR = (uint8_t)c;
+   }
+   
+   static void uart_puts(const char *s)
+   {
+       while (*s) uart_putc(*s++);
+   }
+   
+   /* Send a number in decimal (no printf without a C library) */
+   static void uart_putu(uint32_t v)
+   {
+       char digits[10];
+       int n = 0;
+       do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+       while (n) uart_putc(digits[--n]);                   /* most significant digit first */
+   }
+   
+   int main(void)
+   {
+       RCC_AHB1ENR |= (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5);  /* GPIOB, GPIOC, GPIOD, GPIOF clocks */
+       (void)RCC_AHB1ENR;
+   
+       /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
+       RCC_CFGR = (RCC_CFGR & ~(0x1Fu << 27)) | (7u << 27);   /* MCO2 = SYSCLK (00), MCO2PRE = /5 (111) */
+       GPIOC_AFRH    &= ~(0xFu << 4);                          /* PC9 alternate function 0 = MCO2 */
+       GPIOC_OSPEEDR |= 3u << 18;                              /* PC9 very high speed */
+       GPIOC_MODER    = (GPIOC_MODER & ~(3u << 18)) | (2u << 18);  /* PC9 = alternate function */
+   
+       /* 1. HSE: the 8 MHz clock from the ST-LINK, fed in directly (bypass) */
+       RCC_CR |= 1u << 18;                                     /* HSEBYP */
+       RCC_CR |= 1u << 16;                                     /* HSEON */
+       while (!(RCC_CR & (1u << 17))) {}                       /* wait for HSERDY */
+   
+       /* 2. PLL: 8 MHz / M=4 = 2 MHz, x N=144 = 288 MHz, / P=2 = 144 MHz (Q=6 gives 48 MHz) */
+       RCC_PLLCFGR = (RCC_PLLCFGR & ~0x0F43FFFFu)
+                   | (4u << 0) | (144u << 6) | (0u << 16) | (1u << 22) | (6u << 24);
+       RCC_CR |= 1u << 24;                                     /* PLLON */
+       while (!(RCC_CR & (1u << 25))) {}                       /* wait for PLLRDY */
+   
+       /* 3. Flash: 4 wait states for 144 MHz at 3.3 V, plus prefetch, instruction and data caches */
+       FLASH_ACR = 4u | (1u << 8) | (1u << 9) | (1u << 10);
+       while ((FLASH_ACR & 0xFu) != 4u) {}
+   
+       /* 4. Bus dividers: AHB /1 (144), APB1 /4 (36), APB2 /2 (72) */
+       RCC_CFGR = (RCC_CFGR & ~0xFCF0u) | (5u << 10) | (4u << 13);
+   
+       /* 5. Switch the system clock to the PLL */
+       RCC_CFGR = (RCC_CFGR & ~3u) | 2u;
+       while (((RCC_CFGR >> 2) & 3u) != 2u) {}                 /* wait until SWS reports PLL */
+   
+       GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;
+       GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
+   
+       /* USART3 on PD8 (TX), wired to the ST-LINK's virtual serial port: 115200 baud, 8N1 */
+       RCC_APB1ENR |= 1u << 18;                            /* USART3 clock */
+       (void)RCC_APB1ENR;
+       GPIOD_AFRH  = (GPIOD_AFRH & ~0xFu) | 7u;            /* PD8 alternate function 7 = USART3_TX */
+       GPIOD_MODER = (GPIOD_MODER & ~(3u << 16)) | (2u << 16);  /* PD8 = alternate function */
+       USART3_BRR  = 313;                                  /* 36 MHz / 115200 = 312.5 -> 313 */
+       USART3_CR1  = (1u << 13) | (1u << 3);               /* UE: USART on, TE: transmitter on */
+   
+       /* Cycle counter: counts every CPU clock (144 MHz) */
+       DEMCR     |= 1u << 24;                              /* TRCENA: turn on the debug/trace block */
+       DWT_CYCCNT = 0;
+       DWT_CTRL  |= 1u << 0;                               /* CYCCNTENA: start counting */
+   
+       uint32_t tx = 0;                                    /* cycles the last line took to send */
+       uint32_t next = DWT_CYCCNT;
+       for (;;) {
+           next += period;                                 /* next deadline, from the last one, not from now */
+           while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
+           GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
+           toggles++;
+   
+           if (toggles % 100000u == 0) {                   /* 100,000 flips = once a second */
+               uint32_t start = DWT_CYCCNT;
+               uart_puts("t=");        uart_putu(toggles / 100000u);
+               uart_puts(" toggles="); uart_putu(toggles);
+               uart_puts(" tx=");      uart_putu(tx);
+               uart_puts("\r\n");
+               tx = DWT_CYCCNT - start;                    /* cycles this line took, sent with the next one */
+           }
+       }
+   }
+   ```
+   Register notes (RM0090): USART3 is on APB1, which runs at 36 MHz. With 16× oversampling `BRR` = 36,000,000 ÷ 115,200 = 312.5, rounded to 313, giving 115,016 baud: 0.16% slow, far inside what a UART tolerates (a few %). `TXE` (bit 7 of `USART3_SR`) means the transmitter has room for the next byte. PD8's alternate function 7 connects it to USART3.
+2. From `firmware/`: `make`, then `make flash`.
+3. Watch the output: `picocom -b 115200 /dev/ttyACM0` (quit with Ctrl-A then Ctrl-X). Lines look like:
+   ```
+   t=12 toggles=1200000 tx=388103
+   ```
+   Prediction for `tx`: each byte is 10 bits on the wire (start bit, 8 data bits, stop bit), so 86.9 µs at 115,016 baud. `uart_putc()` returns as soon as the last byte is handed to the transmitter, not when it has finished going out, so a 32-character line measures 31 byte-times: about 2.70 ms, or **about 388,000 cycles**. Each character more or less moves it by about 12,500 cycles. The first line shows `tx=0` because nothing had been sent yet.
+4. Capture PF15 on the LA1010 for **at least 1 s**, so the capture is sure to include a line being sent. A 10 ms capture would catch it only about 1 time in 100. Use **10 MHz and 20 MSa** (2 s): 100 ns per sample is still plenty for 10 µs pulses and a 2.7 ms gap. Then zoom in on the gap. While a line is being sent the CPU is stuck in `uart_putc()` and misses about 270 of PF15's 10 µs deadlines. Afterwards the deadline loop catches up by flipping PF15 as fast as it can until it's back on schedule.
+
+**Done when:** picocom shows one new line per second, with `t` going up by 1 and `toggles` by 100,000 each line; `tx` is about 388,000 cycles for a 32-character line (about 2.7 ms); and the LA1010 shows, once a second, **a gap of about 2.7 ms on PF15 followed by a short burst of fast pulses**, with normal 10 µs pulses either side. That gap is what the project is about: while the CPU waits on I/O, its timing suffers. Interrupts and DMA will fix it later.
