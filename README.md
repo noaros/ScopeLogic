@@ -251,3 +251,96 @@
 - **The scope wave looks rounded** because 28.8 MHz is close to what the scope's 150 MHz bandwidth can show cleanly.
 - **The 5.5 Vpp swing** from a 3.3 V pin is ringing caused by the probe's clip-on ground lead. A spring ground tip would reduce it.
 - **The LA1010 can only resolve 10 ns at 100 MS/s.** The true toggle rate is probably 11.08 MHz, and 11.11 MHz is the closest value it can show.
+
+## Step 5 — Time PF15 with the cycle counter
+
+**Goal:** turn on the Cortex-M4's built-in cycle counter (`DWT_CYCCNT`), which counts every CPU clock at 144 MHz, and use it to toggle PF15 exactly every **1440 cycles (10 µs)** instead of as fast as the loop goes. Every later measurement (CPU load, timing, the benchmarks) relies on this counter.
+
+1. Wiring: same as Step 4. The LA1010 stays on **D2** (PF15, CN10 pin 12) with its GND on **CN10 pin 17**. The scope isn't needed.
+2. Change `firmware/main.c`: add four register addresses, start the counter after the clock switch, and replace the toggle loop with one that waits for a deadline. Everything else is the same as Step 4.
+   ```c
+   #include <stdint.h>
+   
+   #define RCC_CR      (*(volatile uint32_t *)0x40023800)
+   #define RCC_PLLCFGR (*(volatile uint32_t *)0x40023804)
+   #define RCC_CFGR    (*(volatile uint32_t *)0x40023808)
+   #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
+   #define FLASH_ACR   (*(volatile uint32_t *)0x40023C00)
+   #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
+   #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
+   #define GPIOC_MODER   (*(volatile uint32_t *)0x40020800)
+   #define GPIOC_OSPEEDR (*(volatile uint32_t *)0x40020808)
+   #define GPIOC_AFRH    (*(volatile uint32_t *)0x40020824)
+   #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+   #define GPIOF_ODR   (*(volatile uint32_t *)0x40021414)
+   #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+   #define DEMCR       (*(volatile uint32_t *)0xE000EDFC)
+   #define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
+   #define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
+   
+   #define PERIOD 1440u                                    /* 1440 cycles at 144 MHz = 10 us */
+   
+   void Reset_Handler(void)
+   {
+       RCC_AHB1ENR |= (1u << 1) | (1u << 2) | (1u << 5);  /* GPIOB, GPIOC, GPIOF clocks */
+       (void)RCC_AHB1ENR;
+   
+       /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
+       RCC_CFGR = (RCC_CFGR & ~(0x1Fu << 27)) | (7u << 27);   /* MCO2 = SYSCLK (00), MCO2PRE = /5 (111) */
+       GPIOC_AFRH    &= ~(0xFu << 4);                          /* PC9 alternate function 0 = MCO2 */
+       GPIOC_OSPEEDR |= 3u << 18;                              /* PC9 very high speed */
+       GPIOC_MODER    = (GPIOC_MODER & ~(3u << 18)) | (2u << 18);  /* PC9 = alternate function */
+   
+       /* 1. HSE: the 8 MHz clock from the ST-LINK, fed in directly (bypass) */
+       RCC_CR |= 1u << 18;                                     /* HSEBYP */
+       RCC_CR |= 1u << 16;                                     /* HSEON */
+       while (!(RCC_CR & (1u << 17))) {}                       /* wait for HSERDY */
+   
+       /* 2. PLL: 8 MHz / M=4 = 2 MHz, x N=144 = 288 MHz, / P=2 = 144 MHz (Q=6 gives 48 MHz) */
+       RCC_PLLCFGR = (RCC_PLLCFGR & ~0x0F43FFFFu)
+                   | (4u << 0) | (144u << 6) | (0u << 16) | (1u << 22) | (6u << 24);
+       RCC_CR |= 1u << 24;                                     /* PLLON */
+       while (!(RCC_CR & (1u << 25))) {}                       /* wait for PLLRDY */
+   
+       /* 3. Flash: 4 wait states for 144 MHz at 3.3 V, plus prefetch, instruction and data caches */
+       FLASH_ACR = 4u | (1u << 8) | (1u << 9) | (1u << 10);
+       while ((FLASH_ACR & 0xFu) != 4u) {}
+   
+       /* 4. Bus dividers: AHB /1 (144), APB1 /4 (36), APB2 /2 (72) */
+       RCC_CFGR = (RCC_CFGR & ~0xFCF0u) | (5u << 10) | (4u << 13);
+   
+       /* 5. Switch the system clock to the PLL */
+       RCC_CFGR = (RCC_CFGR & ~3u) | 2u;
+       while (((RCC_CFGR >> 2) & 3u) != 2u) {}                 /* wait until SWS reports PLL */
+   
+       GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;
+       GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
+   
+       /* Cycle counter: counts every CPU clock (144 MHz) */
+       DEMCR     |= 1u << 24;                              /* TRCENA: turn on the debug/trace block */
+       DWT_CYCCNT = 0;
+       DWT_CTRL  |= 1u << 0;                               /* CYCCNTENA: start counting */
+   
+       uint32_t next = DWT_CYCCNT;
+       for (;;) {
+           next += PERIOD;                                 /* next deadline, from the last one, not from now */
+           while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
+           GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
+       }
+   }
+   
+   __attribute__((section(".isr_vector"), used))
+   void *const vectors[2] = { (void *)0x20030000, Reset_Handler };
+   ```
+   Register notes (Cortex-M4 / ARMv7-M architecture manual): `DEMCR` bit 24 (`TRCENA`) powers the debug and trace block the counter lives in; `DWT_CTRL` bit 0 (`CYCCNTENA`) starts it. It's a 32-bit counter, so at 144 MHz it wraps every 29.8 s. Comparing `(int32_t)(DWT_CYCCNT - next) < 0` instead of `DWT_CYCCNT < next` keeps the wait correct across the wrap. `GPIOF_ODR` is read to find PF15's current level so the loop can flip it.
+
+   Each deadline is set from the previous deadline, not from "now", so the time spent in the loop never adds up: the edges stay on a fixed 10 µs grid. A hardware timer works the same way, and the ADC sample clock will later.
+3. Build and flash, with the same commands as Step 2 (substeps 4 and 5).
+4. Check the counter is running, without any probe: read it over SWD twice while the board runs. The two values should differ.
+   ```
+   STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32 0xE0001004 1
+   ```
+5. Measure: capture PF15 on the LA1010 at 100 MS/s, 1 MSa (10 ms), as in Step 4. Read the frequency and the high and low widths.
+
+**Done when:** the two counter readings in substep 4 differ, and PF15 is a **50.00 kHz** square wave with high and low widths both about **10.00 µs** that don't drift across the 10 ms capture. Single widths can be off by up to about ±0.1 µs: the wait loop only checks the counter every few cycles (about 6 instructions), so each edge lands up to a few cycles after its deadline, and the LA adds its own ±10 ns sample step. Because the deadlines don't move, those small errors never add up, so the average stays at exactly 50.00 kHz. Write down the frequency and the widths.
