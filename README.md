@@ -784,3 +784,196 @@ LA1010 on PF15 at 10 MHz, 2 s: the whole capture shows two thin breaks about 1.0
 - **A once-a-second event in a 2 s capture is easy to miss when zoomed in.** Zoom all the way out and look for breaks first, then zoom in on one.
 - **Old serial data can be waiting when you open the port.** Somewhere between the ST-LINK and the PC, lines sent while nothing had the port open were held, and arrived in a burst when it was opened (even after clearing the PC's input buffer). Ignore the first lines after opening.
 
+## Step 8 — First ADC readings
+
+**Goal:** get ADC1 working with single conversions started by software, and check it against voltages you already know, before connecting a signal generator. Each second the board reads two inputs and sends the results over the UART from Step 7:
+
+- **VREFINT** (ADC channel 17): the chip's internal reference of about 1.2 V. No wiring needed. At the factory, ST measured what this chip's ADC reads for it at a 3.3 V supply and 30 °C, and stored the result in read-only memory at `0x1FFF7A2A` (`VREFINT_CAL`). This board's value is **1491** (`0x05D3`, read over SWD).
+- **PA3** (header **A0**, ADC channel 3): connected with a jumper wire to GND, then 3V3, then nothing.
+
+From those it works out the real supply voltage, `vdda_mV = 3300 × cal ÷ vref` (if the supply is higher than 3.3 V, the 1.2 V reference is a smaller share of it and reads lower), and A0 in millivolts, `a0_mV = a0 × vdda_mV ÷ 4095`. It also times one conversion with the cycle counter.
+
+1. Wiring: one jumper wire (male–male) into the **A0** socket: **CN9 pin 1**, the first pin of the lower header on the left side, labelled A0. The other end goes into **GND** or **3V3** on **CN8** (the upper left header: 3V3 is pin 7, GND is pin 11 or 13), as each check in substep 4 asks. Check the labels printed next to the sockets. Both are within the ADC's 0–3.3 V range, so nothing can be damaged. The LA1010 can stay on PF15, but it isn't needed.
+2. Change `firmware/main.c`: add the ADC registers, an `adc_read()` function, the ADC setup after the cycle counter starts, and a new line format. The `tx` measurement from Step 7 is gone.
+   ```c
+   #include <stdint.h>
+   
+   #define RCC_CR      (*(volatile uint32_t *)0x40023800)
+   #define RCC_PLLCFGR (*(volatile uint32_t *)0x40023804)
+   #define RCC_CFGR    (*(volatile uint32_t *)0x40023808)
+   #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
+   #define RCC_APB1ENR (*(volatile uint32_t *)0x40023840)
+   #define RCC_APB2ENR (*(volatile uint32_t *)0x40023844)
+   #define FLASH_ACR   (*(volatile uint32_t *)0x40023C00)
+   #define GPIOA_MODER (*(volatile uint32_t *)0x40020000)
+   #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
+   #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
+   #define GPIOC_MODER   (*(volatile uint32_t *)0x40020800)
+   #define GPIOC_OSPEEDR (*(volatile uint32_t *)0x40020808)
+   #define GPIOC_AFRH    (*(volatile uint32_t *)0x40020824)
+   #define GPIOD_MODER (*(volatile uint32_t *)0x40020C00)
+   #define GPIOD_AFRH  (*(volatile uint32_t *)0x40020C24)
+   #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+   #define GPIOF_ODR   (*(volatile uint32_t *)0x40021414)
+   #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+   #define DEMCR       (*(volatile uint32_t *)0xE000EDFC)
+   #define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
+   #define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
+   #define USART3_SR   (*(volatile uint32_t *)0x40004800)
+   #define USART3_DR   (*(volatile uint32_t *)0x40004804)
+   #define USART3_BRR  (*(volatile uint32_t *)0x40004808)
+   #define USART3_CR1  (*(volatile uint32_t *)0x4000480C)
+   #define ADC1_SR     (*(volatile uint32_t *)0x40012000)
+   #define ADC1_CR2    (*(volatile uint32_t *)0x40012008)
+   #define ADC1_SMPR1  (*(volatile uint32_t *)0x4001200C)
+   #define ADC1_SMPR2  (*(volatile uint32_t *)0x40012010)
+   #define ADC1_SQR3   (*(volatile uint32_t *)0x40012034)
+   #define ADC1_DR     (*(volatile uint32_t *)0x4001204C)
+   #define ADC_CCR     (*(volatile uint32_t *)0x40012304)
+   #define VREFINT_CAL (*(volatile uint16_t *)0x1FFF7A2A)  /* factory reading of VREFINT at 3.3 V, 30 C */
+   
+   /* Globals: the startup code sets these up before main() runs */
+   uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
+   uint32_t toggles;                                       /* .bss: starts at 0 */
+   
+   /* Send one byte: wait until the transmitter can take it (TXE), then hand it over */
+   static void uart_putc(char c)
+   {
+       while (!(USART3_SR & (1u << 7))) {}                 /* TXE: transmit data register empty */
+       USART3_DR = (uint8_t)c;
+   }
+   
+   static void uart_puts(const char *s)
+   {
+       while (*s) uart_putc(*s++);
+   }
+   
+   /* Send a number in decimal (no printf without a C library) */
+   static void uart_putu(uint32_t v)
+   {
+       char digits[10];
+       int n = 0;
+       do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+       while (n) uart_putc(digits[--n]);                   /* most significant digit first */
+   }
+   
+   static void uart_field(const char *name, uint32_t v)   /* sends e.g. " a0=1234" */
+   {
+       uart_puts(name);
+       uart_putu(v);
+   }
+   
+   /* One conversion, started by software, waited for by polling */
+   static uint32_t adc_read(uint32_t channel)
+   {
+       ADC1_SQR3 = channel;                                /* the one channel to convert */
+       ADC1_CR2 |= 1u << 30;                               /* SWSTART: start a conversion */
+       while (!(ADC1_SR & (1u << 1))) {}                   /* wait for EOC: end of conversion */
+       return ADC1_DR;                                     /* 12-bit result, 0..4095; reading it clears EOC */
+   }
+   
+   int main(void)
+   {
+       RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5);  /* GPIOA, B, C, D, F clocks */
+       (void)RCC_AHB1ENR;
+   
+       /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
+       RCC_CFGR = (RCC_CFGR & ~(0x1Fu << 27)) | (7u << 27);   /* MCO2 = SYSCLK (00), MCO2PRE = /5 (111) */
+       GPIOC_AFRH    &= ~(0xFu << 4);                          /* PC9 alternate function 0 = MCO2 */
+       GPIOC_OSPEEDR |= 3u << 18;                              /* PC9 very high speed */
+       GPIOC_MODER    = (GPIOC_MODER & ~(3u << 18)) | (2u << 18);  /* PC9 = alternate function */
+   
+       /* 1. HSE: the 8 MHz clock from the ST-LINK, fed in directly (bypass) */
+       RCC_CR |= 1u << 18;                                     /* HSEBYP */
+       RCC_CR |= 1u << 16;                                     /* HSEON */
+       while (!(RCC_CR & (1u << 17))) {}                       /* wait for HSERDY */
+   
+       /* 2. PLL: 8 MHz / M=4 = 2 MHz, x N=144 = 288 MHz, / P=2 = 144 MHz (Q=6 gives 48 MHz) */
+       RCC_PLLCFGR = (RCC_PLLCFGR & ~0x0F43FFFFu)
+                   | (4u << 0) | (144u << 6) | (0u << 16) | (1u << 22) | (6u << 24);
+       RCC_CR |= 1u << 24;                                     /* PLLON */
+       while (!(RCC_CR & (1u << 25))) {}                       /* wait for PLLRDY */
+   
+       /* 3. Flash: 4 wait states for 144 MHz at 3.3 V, plus prefetch, instruction and data caches */
+       FLASH_ACR = 4u | (1u << 8) | (1u << 9) | (1u << 10);
+       while ((FLASH_ACR & 0xFu) != 4u) {}
+   
+       /* 4. Bus dividers: AHB /1 (144), APB1 /4 (36), APB2 /2 (72) */
+       RCC_CFGR = (RCC_CFGR & ~0xFCF0u) | (5u << 10) | (4u << 13);
+   
+       /* 5. Switch the system clock to the PLL */
+       RCC_CFGR = (RCC_CFGR & ~3u) | 2u;
+       while (((RCC_CFGR >> 2) & 3u) != 2u) {}                 /* wait until SWS reports PLL */
+   
+       GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;
+       GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
+   
+       /* USART3 on PD8 (TX), wired to the ST-LINK's virtual serial port: 115200 baud, 8N1 */
+       RCC_APB1ENR |= 1u << 18;                            /* USART3 clock */
+       (void)RCC_APB1ENR;
+       GPIOD_AFRH  = (GPIOD_AFRH & ~0xFu) | 7u;            /* PD8 alternate function 7 = USART3_TX */
+       GPIOD_MODER = (GPIOD_MODER & ~(3u << 16)) | (2u << 16);  /* PD8 = alternate function */
+       USART3_BRR  = 313;                                  /* 36 MHz / 115200 = 312.5 -> 313 */
+       USART3_CR1  = (1u << 13) | (1u << 3);               /* UE: USART on, TE: transmitter on */
+   
+       /* Cycle counter: counts every CPU clock (144 MHz) */
+       DEMCR     |= 1u << 24;                              /* TRCENA: turn on the debug/trace block */
+       DWT_CYCCNT = 0;
+       DWT_CTRL  |= 1u << 0;                               /* CYCCNTENA: start counting */
+   
+       /* ADC1: PA3 (A0, channel 3) and the internal reference VREFINT (channel 17) */
+       RCC_APB2ENR |= 1u << 8;                             /* ADC1 clock */
+       (void)RCC_APB2ENR;
+       GPIOA_MODER |= 3u << 6;                             /* PA3 = analog */
+       ADC_CCR = (ADC_CCR & ~(3u << 16)) | (1u << 23);     /* ADCPRE = /2: 72 MHz APB2 -> 36 MHz ADC clock; TSVREFE: VREFINT on */
+       ADC1_SMPR2 |= 7u << 9;                              /* channel 3: sample for 480 ADC cycles */
+       ADC1_SMPR1 |= 7u << 21;                             /* channel 17: 480 cycles (VREFINT needs at least 10 us) */
+       ADC1_CR2   |= 1u << 0;                              /* ADON: power up the ADC */
+       uint32_t t0 = DWT_CYCCNT;
+       while (DWT_CYCCNT - t0 < 20u * 144u) {}             /* wait 20 us for the ADC and VREFINT to settle */
+   
+       uint32_t next = DWT_CYCCNT;
+       for (;;) {
+           next += period;                                 /* next deadline, from the last one, not from now */
+           while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
+           GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
+           toggles++;
+   
+           if (toggles % 100000u == 0) {                   /* 100,000 flips = once a second */
+               uint32_t c0   = DWT_CYCCNT;
+               uint32_t a0   = adc_read(3);
+               uint32_t conv = DWT_CYCCNT - c0;            /* cycles one conversion took */
+               uint32_t vref = adc_read(17);
+               uint32_t cal  = VREFINT_CAL;
+               uint32_t vdda_mV = vref ? 3300u * cal / vref : 0;  /* real supply: VREFINT read low = supply high */
+               uint32_t a0_mV   = a0 * vdda_mV / 4095u;
+   
+               uart_field("t=",        toggles / 100000u);
+               uart_field(" a0=",      a0);
+               uart_field(" a0_mV=",   a0_mV);
+               uart_field(" vref=",    vref);
+               uart_field(" cal=",     cal);
+               uart_field(" vdda_mV=", vdda_mV);
+               uart_field(" conv=",    conv);
+               uart_puts("\r\n");
+           }
+       }
+   }
+   ```
+   Register notes (RM0090, datasheet DS9405): the ADC clock is APB2 (72 MHz) ÷ 2 = **36 MHz**, its maximum; that's why Step 4 chose 144 MHz. `TSVREFE` in `ADC_CCR` switches VREFINT on. Both channels sample for 480 ADC cycles because VREFINT needs at least 10 µs of sampling. The ADC needs about 3 µs after `ADON` and VREFINT up to 10 µs after `TSVREFE` before readings are valid, so the code waits 20 µs. `adc_read()` is polling: start a conversion, wait for `EOC`, read the result.
+
+   Prediction for `conv`: 480 sampling + 12 conversion cycles = 492 ADC cycles at 36 MHz = 13.67 µs, which is **about 1,970 CPU cycles**, plus a few dozen for the code and the bus.
+3. From `firmware/`: `make`, then `make flash`. Watch with `picocom -b 115200 /dev/ttyACM0` (quit with Ctrl-A then Ctrl-X). Lines look like:
+   ```
+   t=12 a0=0 a0_mV=0 vref=1490 cal=1491 vdda_mV=3302 conv=1990
+   ```
+4. Watch a few lines each way: A0 to **GND**, A0 to **3V3**, and A0 with the wire **removed**.
+
+**Done when:**
+- `vref` is within about ±1% of `cal` (1476–1506), and `vdda_mV` is about 3300 (3250–3350). The board's 3.3 V regulator sets the real supply, and the ADC's readings are relative to it.
+- A0 to GND reads under about 10, and A0 to 3V3 reads over about 4085. A0 to 3V3 is the supply itself, so `a0_mV` should come out close to `vdda_mV`.
+- A0 with nothing connected gives readings that wander. A floating input picks up whatever is nearby, so there's no right value.
+- `conv` is about 1,970 cycles, steady from line to line.
+
+Write down `cal`, a typical `vref` and `vdda_mV`, the GND and 3V3 readings, and `conv`.
