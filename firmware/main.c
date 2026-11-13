@@ -17,9 +17,11 @@
 #define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
 #define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
 
-#define PERIOD 1440u                                    /* 1440 cycles at 144 MHz = 10 us */
+/* Globals: the startup code sets these up before main() runs */
+uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
+uint32_t toggles;                                       /* .bss: starts at 0 */
 
-void Reset_Handler(void)
+int main(void)
 {
     RCC_AHB1ENR |= (1u << 1) | (1u << 2) | (1u << 5);  /* GPIOB, GPIOC, GPIOF clocks */
     (void)RCC_AHB1ENR;
@@ -63,11 +65,9 @@ void Reset_Handler(void)
 
     uint32_t next = DWT_CYCCNT;
     for (;;) {
-        next += PERIOD;                                 /* next deadline, from the last one, not from now */
+        next += period;                                 /* next deadline, from the last one, not from now */
         while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
         GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
+        toggles++;
     }
 }
-
-__attribute__((section(".isr_vector"), used))
-void *const vectors[2] = { (void *)0x20030000, Reset_Handler };

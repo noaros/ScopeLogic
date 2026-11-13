@@ -569,9 +569,39 @@
 8. Unplug and replug the Nucleo's USB. RAM keeps its contents through a reset, but not through a power cycle, so this makes sure `period` really came from the startup code and not from the previous program.
 9. Read both globals over SWD while the board runs, twice:
    ```
-   STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32 0x20000000 2
+   STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32 0x20000000 8
    ```
-   The first word is `period`, the second is `toggles`.
+   The `8` is the number of **bytes** to read (two 32-bit words). The first word is `period`, the second is `toggles`.
 10. Measure PF15 on the LA1010 as in Step 5 (100 MS/s, 1 MSa).
 
 **Done when:** `make` and `make flash` work; after the power cycle, `period` reads `0x000005A0` (1440); `toggles` goes up between the two reads at about **100,000 per second** (two flips per 20 µs period: about 4,500 for reads 45 ms apart); and PF15 is still a 50 kHz square wave with 10 µs high and low widths, as in Step 5. If `period` hadn't been copied, PF15 would run at some other rate: as fast as the loop can go if it were 0, or something odd if it were random.
+
+**Measured (after a power cycle):** `make` reported `data 4`, `bss 4`; `nm` put `period` at `0x20000000` and `toggles` at `0x20000004`. Over SWD: `period` = **`0x000005A0`** (1440) in both reads; `toggles` = 735,743 then 739,477, up 3,734 in about 40 ms, which is about 100,000 per second, and 735,743 is about 7.4 s of counting since power-up. PF15 on the LA1010 at 100 MS/s: the same 50 kHz square wave as Step 5, every high and low part **10.0 µs** (read off the screenshot, ±0.05 µs), with edges 2.6 ms into the capture still on the 10 µs grid.
+
+![LA1010 on PF15 at 100 MS/s after Step 6: still a 50 kHz square wave, edges every 10 µs](docs/step6-pf15.png)
+
+### Step 6 summary
+
+**Step 6 added startup code, so global variables start with the values C promises, gave the CPU a proper vector table, and replaced the hand-typed build and flash commands with a Makefile. The board behaves exactly as in Step 5. The difference is that the 10 µs period now comes from a global variable.**
+
+**What changed:**
+1. **Linker script:** new `.data` section (in RAM, starting values stored in flash) and `.bss` section (in RAM, zeroed), plus the addresses the startup code needs.
+2. **`startup.c` (new):** `Reset_Handler` copies `.data` from flash to RAM, zeroes `.bss`, then calls `main()`. The vector table now has all 16 Cortex-M4 entries, with faults and unused interrupts going to `Default_Handler`.
+3. **`main.c`:** `Reset_Handler` became `main()`; the period is the global `period` (`.data`), and the global `toggles` (`.bss`) counts flips.
+4. **`Makefile` (new):** `make`, `make flash`, `make clean`.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| `make` sizes | data 4, bss 4 | data 4, bss 4 |
+| `period` after power cycle | `0x5A0` (1440) | `0x5A0` |
+| `toggles` rate | about 100,000 per second | 3,734 in about 40 ms (about 100,000 per second) |
+| PF15 | 50 kHz, 10 µs high and low | 50 kHz, 10.0 µs high and low |
+
+**What you learned along the way:**
+- **Globals don't set themselves up.** On a PC the operating system and C library do it before `main()`; with `-nostdlib` your own `Reset_Handler` has to.
+- **An initialized global lives in two places:** its starting value in flash (`_sidata`), and the variable itself in RAM (`_sdata`). `AT > FLASH` in the linker script is what sets that up.
+- **RAM keeps its contents through a reset but not a power cycle,** so only a power cycle shows the startup code really did the copy.
+- **`STM32_Programmer_CLI -r32` takes its size in bytes**, not words: `8` reads two 32-bit values.
+- **`weak` handlers** let later steps add an interrupt handler just by writing a function with the right name, such as `SysTick_Handler`.
