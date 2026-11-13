@@ -738,9 +738,49 @@ No extra wiring: on the NUCLEO-F429ZI, USART3 (PD8 TX, PD9 RX) is connected to t
 2. From `firmware/`: `make`, then `make flash`.
 3. Watch the output: `picocom -b 115200 /dev/ttyACM0` (quit with Ctrl-A then Ctrl-X). Lines look like:
    ```
-   t=12 toggles=1200000 tx=388103
+   t=12 toggles=1200000 tx=375807
    ```
-   Prediction for `tx`: each byte is 10 bits on the wire (start bit, 8 data bits, stop bit), so 86.9 µs at 115,016 baud. `uart_putc()` returns as soon as the last byte is handed to the transmitter, not when it has finished going out, so a 32-character line measures 31 byte-times: about 2.70 ms, or **about 388,000 cycles**. Each character more or less moves it by about 12,500 cycles. The first line shows `tx=0` because nothing had been sent yet.
-4. Capture PF15 on the LA1010 for **at least 1 s**, so the capture is sure to include a line being sent. A 10 ms capture would catch it only about 1 time in 100. Use **10 MHz and 20 MSa** (2 s): 100 ns per sample is still plenty for 10 µs pulses and a 2.7 ms gap. Then zoom in on the gap. While a line is being sent the CPU is stuck in `uart_putc()` and misses about 270 of PF15's 10 µs deadlines. Afterwards the deadline loop catches up by flipping PF15 as fast as it can until it's back on schedule.
+   Prediction for `tx`: each byte is 10 bits on the wire (start bit, 8 data bits, stop bit), so 86.9 µs at 115,016 baud. The transmitter holds two bytes at once: one in the shift register that's sending bits, and one waiting in the data register. So the first two bytes of a line go in without waiting, and `uart_puts()` returns as soon as the last byte is handed over, not when it has finished going out. A line of *n* characters therefore measures *n* − 2 byte-times: for a 32-character line, 30 × 86.9 µs = 2.61 ms, or **about 375,600 cycles** (plus a couple of hundred cycles for the code itself). Each character more or less moves it by about 12,500 cycles. The first line shows `tx=0` because nothing had been sent yet.
+4. Capture PF15 on the LA1010 for **at least 1 s**, so the capture is sure to include a line being sent. A 10 ms capture would catch it only about 1 time in 100. Use **10 MHz and 20 MSa** (2 s): 100 ns per sample is still plenty for 10 µs pulses and a gap of a few ms. Then zoom in on the gap. While a line is being sent the CPU is stuck in `uart_putc()` and misses about 260 of PF15's 10 µs deadlines. Afterwards the deadline loop catches up by flipping PF15 as fast as it can until it's back on schedule.
 
-**Done when:** picocom shows one new line per second, with `t` going up by 1 and `toggles` by 100,000 each line; `tx` is about 388,000 cycles for a 32-character line (about 2.7 ms); and the LA1010 shows, once a second, **a gap of about 2.7 ms on PF15 followed by a short burst of fast pulses**, with normal 10 µs pulses either side. That gap is what the project is about: while the CPU waits on I/O, its timing suffers. Interrupts and DMA will fix it later.
+**Done when:** picocom shows one new line per second, with `t` going up by 1 and `toggles` by 100,000 each line; `tx` is about (*n* − 2) × 12,520 cycles for an *n*-character line: about 375,600 (2.6 ms) for 32 characters, about 350,600 (2.4 ms) for the 30-character lines while `t` is below 10; and the LA1010 shows, once a second, **a gap on PF15 of about (*n* − 2) byte-times (2.4–3.0 ms, depending on line length), followed by a short burst of fast pulses**, with normal 10 µs pulses either side. That gap is what the project is about: while the CPU waits on I/O, its timing suffers. Interrupts and DMA will fix it later.
+
+**Measured:** one line per second, `t` +1 and `toggles` +100,000 every line. `tx` against the *n* − 2 rule:
+
+| Line length | When | Predicted | Measured `tx` |
+|---|---|---|---|
+| 30 characters | `t` = 1–9 | 350,560 | 350,704–351,935 |
+| 32 characters | `t` = 10–99 | 375,600 | 375,752–376,967 |
+| 36 characters | `t` ≥ 1000 | 425,680 | 426,295–426,357 |
+
+The extra few hundred to ~1,250 cycles is the code itself plus waiting for the UART's bit clock: a byte can only start on the next bit tick, which adds 0 to 1 bit-time (about 1,250 cycles). It creeps up by about 32 cycles per line and then drops back, as the 1 s schedule slides against that clock.
+
+LA1010 on PF15 at 10 MHz, 2 s: the whole capture shows two thin breaks about 1.00 s apart (at 0.153 s and 1.151 s). Zoomed in on one: normal 10 µs pulses, then PF15 stays low for **2.79 ms**, then a dense burst of about **0.13 ms** (about 280 catch-up flips, about 0.46 µs or 67 cycles each), then normal pulses back on schedule. The capture was taken while `t` was in the hundreds, when lines were 34 characters long: predicted 32 byte-times = 2.78 ms.
+
+![LA1010 on PF15 at 10 MHz: normal pulses, a 2.79 ms gap while a line is sent, the catch-up burst, then normal pulses](docs/step7-gap.png)
+
+### Step 7 summary
+
+**Step 7 got text from the board to the PC over the ST-LINK's USB serial port, and measured what sending it costs: while the CPU waits on the UART, PF15's 10 µs timing stops for 2.4–3 ms once a second.**
+
+**What changed in the firmware:**
+1. **USART3 setup:** GPIOD and USART3 clocks on, PD8 to alternate function 7, `BRR` = 313 for 115,016 baud from the 36 MHz APB1 clock, transmitter on.
+2. **Send functions:** `uart_putc()` waits for `TXE` and writes a byte; `uart_puts()` sends a string; `uart_putu()` sends a number in decimal (there's no `printf` without a C library).
+3. **Once a second** (every 100,000 flips): send `t`, `toggles` and `tx`, the cycles the previous line took, timed with the cycle counter.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| Lines on `/dev/ttyACM0` | one per second | one per second |
+| `t`, `toggles` | +1, +100,000 per line | +1, +100,000 per line |
+| `tx`, 32-character line | about 375,600 cycles | 375,752–376,967 |
+| PF15 gap, 34-character line | about 2.78 ms | 2.79 ms, then a 0.13 ms catch-up burst |
+
+**What you learned along the way:**
+- **The UART holds two bytes at once** (shift register + data register), so sending *n* characters blocks for *n* − 2 byte-times, not *n*. My first prediction (*n* − 1) was wrong; the measurement caught it.
+- **A byte on the wire is 10 bits** (start, 8 data, stop): 86.9 µs at 115,016 baud.
+- **Blocking I/O wrecks timing.** For 2.4–3 ms per line the CPU can do nothing else, so PF15 misses about 280 deadlines. The deadline loop then catches up as fast as it can, so the average rate stays right but the spacing doesn't. That's the problem interrupts and DMA solve in later steps.
+- **A once-a-second event in a 2 s capture is easy to miss when zoomed in.** Zoom all the way out and look for breaks first, then zoom in on one.
+- **Old serial data can be waiting when you open the port.** Somewhere between the ST-LINK and the PC, lines sent while nothing had the port open were held, and arrived in a burst when it was opened (even after clearing the PC's input buffer). Ignore the first lines after opening.
+
