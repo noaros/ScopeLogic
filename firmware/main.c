@@ -11,7 +11,13 @@
 #define GPIOC_OSPEEDR (*(volatile uint32_t *)0x40020808)
 #define GPIOC_AFRH    (*(volatile uint32_t *)0x40020824)
 #define GPIOF_MODER (*(volatile uint32_t *)0x40021400)
+#define GPIOF_ODR   (*(volatile uint32_t *)0x40021414)
 #define GPIOF_BSRR  (*(volatile uint32_t *)0x40021418)
+#define DEMCR       (*(volatile uint32_t *)0xE000EDFC)
+#define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
+#define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
+
+#define PERIOD 1440u                                    /* 1440 cycles at 144 MHz = 10 us */
 
 void Reset_Handler(void)
 {
@@ -50,9 +56,16 @@ void Reset_Handler(void)
     GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
     GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
 
+    /* Cycle counter: counts every CPU clock (144 MHz) */
+    DEMCR     |= 1u << 24;                              /* TRCENA: turn on the debug/trace block */
+    DWT_CYCCNT = 0;
+    DWT_CTRL  |= 1u << 0;                               /* CYCCNTENA: start counting */
+
+    uint32_t next = DWT_CYCCNT;
     for (;;) {
-        GPIOF_BSRR = 1u << 15;
-        GPIOF_BSRR = 1u << (15 + 16);
+        next += PERIOD;                                 /* next deadline, from the last one, not from now */
+        while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
+        GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
     }
 }
 
