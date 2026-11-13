@@ -174,3 +174,31 @@
 ![Scope on PC9: MCO2 = SYSCLK ÷ 5, Freq = 28.90 MHz at 10 ns/div](docs/step4-mco2.png)
 
 ![LA1010 on PF15 at 100 MS/s: about 11 pulses per microsecond (11.11 MHz)](docs/step4-pf15.png)
+
+### Step 4 summary
+
+**Step 4 switched the CPU from its 16 MHz internal clock to 144 MHz from the PLL. The scope and the logic analyzer both confirmed the new speed.**
+
+**Why 144 MHz:** it's chosen for the ADC, not the CPU. It puts APB2 at 72 MHz, which lets the ADC clock run at its 36 MHz maximum later (2.4 MSPS). 180 MHz would have limited the ADC clock to 22.5 MHz.
+
+**What the firmware does, in order:**
+1. Sets PC9 to output SYSCLK ÷ 5 (MCO2), so the scope can measure the clock.
+2. Turns on HSE, the 8 MHz clock from the ST-LINK, fed in directly (bypass mode).
+3. Sets up the PLL: 8 MHz ÷ 4 × 144 ÷ 2 = 144 MHz.
+4. Sets flash to 4 wait states and turns on the prefetch and caches. This has to happen before the speed goes up.
+5. Sets the bus dividers: AHB 144 MHz, APB1 36 MHz, APB2 72 MHz, all within their limits.
+6. Switches the system clock to the PLL, then turns LD1 on and toggles PF15 as in Step 3.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| LD1 | on | on |
+| Scope on PC9 | about 28.8 MHz | **28.90 MHz** |
+| LA1010 on PF15 | about 9× 1.25 MHz | **11.11 MHz** (8.9×) |
+
+**What you learned along the way:**
+- **The toggle loop still takes about 13 cycles.** The flash wait states cost nothing in a loop this small, because the ART cache serves it.
+- **The scope wave looks rounded** because 28.8 MHz is close to what the scope's 150 MHz bandwidth can show cleanly.
+- **The 5.5 Vpp swing** from a 3.3 V pin is ringing caused by the probe's clip-on ground lead. A spring ground tip would reduce it.
+- **The LA1010 can only resolve 10 ns at 100 MS/s.** The true toggle rate is probably 11.08 MHz, and 11.11 MHz is the closest value it can show.
