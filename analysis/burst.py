@@ -57,7 +57,7 @@ def main():
     vdda = int(header["vdda_mV"])
     if "fs" in header:                              # Step 10 on: samples paced by TIM1
         dt = 1 / int(header["fs"])
-        extra = ", ".join(f"{k} {header[k]}" for k in ("span", "missed", "burst", "ndtr", "dma_err") if k in header)
+        extra = ", ".join(f"{k} {header[k]}" for k in ("mode", "load", "span", "missed", "burst", "ndtr", "dma_err") if k in header)
         print(f"burst: {len(s)} samples at {int(header['fs']) / 1e3:g} kHz ({dt * 1e6:.3f} us apart), "
               f"{extra}, VDDA {vdda} mV")
     else:                                           # Step 9: back to back, spacing from the burst time
@@ -84,6 +84,10 @@ def main():
         print(f"frequency {f:.1f} Hz ({len(times)} rising crossings)")
         print(f"sine fit: amplitude {amp:.0f} mV ({2 * amp:.0f} mVpp), offset {coef[2]:.0f} mV")
         print(f"residual: rms {resid.std():.1f} mV, worst {np.abs(resid).max():.0f} mV")
+        spec = np.abs(np.fft.rfft(resid * np.hanning(len(resid))))
+        freqs = np.fft.rfftfreq(len(resid), dt)
+        top = np.argsort(spec[1:])[::-1][:3] + 1        # skip 0 Hz
+        print("residual peaks: " + ", ".join(f"{freqs[i]:.0f} Hz" for i in top))
     else:
         print("no sine found (swing under 500 mV or fewer than 2 rising crossings): "
               f"spread {mv.std():.1f} mV rms around the mean")

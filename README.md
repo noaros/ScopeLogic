@@ -2119,3 +2119,62 @@ Predictions:
 - `burst.py` passes in all three modes.
 
 Write down `idle_base`, `idle` and `load` for each mode, `late_max` for polling and interrupts, and the residual peaks in each mode.
+
+**Measured** (30 lines per mode, back to back, light load, acquisition first):
+
+| Mode | `idle_base` | `idle` | `load` | Other checks |
+|---|---|---|---|---|
+| 1, polling | 68,539–68,540 | 0 | **10000 (100%)** | `missed=0`; `late_max` 29–31 on most lines, up to 381 on 7 lines |
+| 2, interrupts | 68,539–68,540 | 58,520–58,588 | **1452–1462 (14.5–14.6%)** | `missed=0`, `n_late=0`; `late_max` 27, once 29 |
+| 3, DMA | 68,540 | 68,540 | **0 (0.00%)** | `ndtr=0`, `dma_err=0` |
+
+- **`idle_base` is 68,540, not the predicted 120,000**, but it's the same in all three modes and steady to 1 count. That's 21 cycles per pass, not 12: the loop's loads and stores to the stack and its DWT reads take more than one cycle each. Both windows use the same loop, so this doesn't change the load.
+- **Interrupts take about 210 cycles of every 1,440** (14.6%), a bit above the predicted 150–200. The small variation (1452–1462) follows a 7-line cycle: the lowest values come at t = 5, 12, 19 and 26, the same rhythm as SysTick's drift against the samples in Step 11. So it depends on where SysTick lands relative to the samples.
+- **DMA's `idle` equals `idle_base` exactly** on every line, so this isn't the clamp: the DMA didn't take a single loop pass. The CPU's loop and the DMA use different RAM blocks.
+- **Polling's lateness** is the same as Step 11's even with acquisition first: a polling loop can't preempt an interrupt.
+
+`analysis/burst.py`, three runs per mode:
+
+| Mode | Frequency | Peak-to-peak | Offset | Residual rms / worst | Top residual peaks |
+|---|---|---|---|---|---|
+| Polling | 1999.9–2000.5 Hz | 1984–1988 mV | 1643–1645 mV | 8.8–11.1 / 58–60 mV | 49,100–49,800 Hz in all three; 500 Hz once in third place |
+| Interrupts | 1999.6–2000.1 Hz | 1980–1986 mV | 1642–1644 mV | 8.3–9.5 / 36–45 mV | **400 and 500 Hz** first and second in all three |
+| DMA | 1999.8–2000.2 Hz | 1985–1988 mV | 1645–1646 mV | 8.1–9.8 / 34–40 mV | **400 and 500 Hz** first and second in all three |
+
+**The 400–500 Hz wave** is now clearly tied to the mode: present with interrupts and DMA, absent with polling, in back-to-back runs with nothing else changed. Polling's residual instead peaks just under 50 kHz, half the sample rate: consecutive samples alternate slightly up and down.
+
+A likely explanation, not yet tested: in polling, the CPU does exactly the same thing at every sample instant, because it waits on the tick. In interrupt and DMA modes it runs a loop at its own pace, so what it's doing when the ADC samples drifts slowly from one sample to the next. The CPU's switching noise reaches the ADC, so a slowly drifting activity pattern can show up as a slow wave. **A test for later:** put the CPU to sleep (`WFI`) during a DMA burst, which removes that activity, and see if the wave goes.
+
+### Step 14 summary
+
+**Step 14 puts the three acquisition modes behind `#define MODE` and measures each one's CPU load with an idle counter: polling 100%, interrupts 14.6%, DMA 0.00% at 100 kHz.**
+
+**What changed:**
+1. **`#define MODE`** picks the burst code: 1 = Step 11's polling loop, 2 = Step 12's interrupts, 3 = Step 13's DMA.
+2. **`idle_loop()`** counts its own passes for a fixed window of 1,002 sample periods. It runs once with no acquisition (`idle_base`) and once during the burst (`idle`). Load = 1 − `idle` / `idle_base`, sent in units of 0.01%.
+3. **`burst.py`** prints `mode` and `load`, and the residual's three biggest spectrum peaks.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| `idle_base`, all modes | about 120,000, the same in each | 68,539–68,540 in each |
+| Polling load | 100% | 100% |
+| Interrupt load | 10–15% | 14.5–14.6% |
+| DMA load | about 0 | 0.00% (`idle` = `idle_base`) |
+| Polling `missed` / interrupt `n_late` / DMA `ndtr` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `burst.py`, all modes | 2 kHz ± 0.1%, as Step 13 | 1999.6–2000.5 Hz, 1980–1988 mVpp |
+
+**The benchmark at 100 kHz, with a 1 kHz, 2 µs background load:**
+
+| Mode | CPU load | Worst lateness after the tick | Clock jitter |
+|---|---|---|---|
+| Polling | 100% | 2.5 µs | about 5 ns |
+| Interrupts, acquisition first | 14.6% | 56 ns (spread 4 cycles idle) | about 5 ns |
+| DMA | 0.00% | fixed by hardware | about 5 ns |
+
+**What you learned along the way:**
+- **Measure CPU load by what's left over.** A counting loop loses passes to everything that takes the CPU, including interrupt entry and exit, which a pin toggled inside the handler would miss.
+- **Compare against a baseline taken the same way.** `idle_base` uses the same loop and the same window, so the loop's own speed (21 cycles per pass, not the 12 predicted) cancels out.
+- **DMA doesn't have to slow the CPU.** The bus matrix lets the CPU and DMA2 use different RAM blocks at once, and here the DMA cost the loop nothing.
+- **Running the modes back to back is a fair test.** The same hardware, wiring and minutes showed the 400–500 Hz wave following the mode, which one run at a time couldn't.

@@ -66,12 +66,15 @@
 #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
 #define PERIOD (144000000u / FS)                        /* CPU cycles per sample: 1440 */
 
+#define MODE 3                                          /* 1 = polling, 2 = interrupts, 3 = DMA */
+#define WINDOW ((NSAMP + 2u) * PERIOD)                  /* idle-count window: the whole burst plus 2 periods */
+
 #define LOAD 1                                          /* 1: background SysTick load on, 0: off */
 #define SYSTICK_CYCLES 144007u                          /* about 1 kHz; deliberately not a multiple of PERIOD */
 #define LOAD_CYCLES    288u                             /* 2 us of busy work per interrupt */
 #define LATE_LIMIT     100u                             /* a sample more than this many cycles late counts as late */
-#define ACQ_PRIO       1u                               /* priority of the TIM1 and ADC interrupts: 0 is the highest */
-#define SYSTICK_PRIO   0u                               /* priority of the background load */
+#define ACQ_PRIO       0u                               /* priority of the TIM1 and ADC interrupts: 0 is the highest */
+#define SYSTICK_PRIO   1u                               /* priority of the background load */
 
 /* Globals: the startup code sets these up before main() runs */
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
@@ -94,6 +97,15 @@ void SysTick_Handler(void)
 /* Burst state, shared between the interrupts and main(): all volatile */
 volatile uint32_t n_started, n_done, missed, first, last;
 volatile uint32_t late_min, late_max, n_late;
+
+/* Count loop passes for a fixed number of cycles. Any cycle an interrupt or the DMA
+   takes away is a cycle this loop doesn't run, so fewer passes = more CPU used elsewhere */
+static uint32_t idle_loop(uint32_t cycles)
+{
+    uint32_t n = 0, t0 = DWT_CYCCNT;
+    while (DWT_CYCCNT - t0 < cycles) n++;
+    return n;
+}
 
 /* Every TIM1 tick: start one conversion */
 void TIM1_CC_IRQHandler(void)
@@ -254,6 +266,31 @@ int main(void)
         toggles++;
 
         if (toggles % 100000u == 0) {                   /* once a second */
+            uint32_t idle_base = idle_loop(WINDOW);     /* the same window with no acquisition running */
+            uint32_t idle = 0;                          /* polling never leaves its loop: no idle time */
+            missed = 0; late_min = PERIOD; late_max = 0; n_late = 0;
+#if MODE == 1
+            TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+            for (uint32_t i = 0; i < NSAMP; i++) {
+                while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
+                TIM1_SR = ~(1u << 1);                   /* clear it */
+                uint32_t cnt = TIM1_CNT;                /* where the timer is now */
+                samples[i] = (uint16_t)adc_read(3);
+                uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
+                if (late < late_min) late_min = late;
+                if (late > late_max) late_max = late;
+                if (late > LATE_LIMIT) n_late++;
+                if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
+            }
+#elif MODE == 2
+            n_started = 0; n_done = 0;
+            ADC1_SQR3 = 3;                              /* A0 for the whole burst */
+            ADC1_CR1 |= 1u << 5;                        /* EOCIE: interrupt at the end of each conversion */
+            TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+            TIM1_DIER |= 1u << 1;                       /* CC1IE: interrupt on every tick from now on */
+            idle = idle_loop(WINDOW);                   /* the burst runs in the interrupts meanwhile */
+            while (n_done < NSAMP) {}                   /* already done: the window is longer than the burst */
+#else
             DMA2_LIFCR  = 0x3Du;                        /* clear stream 0's flags from the last burst */
             DMA2_S0NDTR = NSAMP;                        /* move 1,000 results */
             DMA2_S0PAR  = (uint32_t)&ADC1_DR;           /* from the ADC's data register */
@@ -263,19 +300,22 @@ int main(void)
             ADC1_SQR3   = 3;                            /* A0 */
             ADC1_SR     = 0;                            /* clear EOC and OVR */
             ADC1_CR2   |= 1u << 8;                      /* DMA: a request after every conversion */
+            ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising */
+            idle = idle_loop(WINDOW);                   /* the burst runs in hardware meanwhile */
             uint32_t t_start = DWT_CYCCNT;
-            ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising: the timer starts each conversion */
-            while (!(DMA2_LISR & (1u << 5))             /* TCIF0: all 1,000 moved */
-                   && DWT_CYCCNT - t_start < 2u * NSAMP * PERIOD) {}  /* give up after twice the expected time */
-            uint32_t burst = DWT_CYCCNT - t_start;
+            while (!(DMA2_LISR & (1u << 5))             /* TCIF0: should already be set */
+                   && DWT_CYCCNT - t_start < NSAMP * PERIOD) {}
             ADC1_CR2   &= ~((3u << 28) | (1u << 8));    /* trigger off, DMA off */
             uint32_t ndtr = DMA2_S0NDTR;                /* results not moved: 0 if the burst completed */
-            uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0: transfer or direct-mode errors */
-            DMA2_S0CR  &= ~(1u << 0);                   /* stream off (already off if it completed) */
+            uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0 */
+            DMA2_S0CR  &= ~(1u << 0);                   /* stream off */
             uint32_t t1 = DWT_CYCCNT;
             while (DWT_CYCCNT - t1 < 300u) {}           /* let a conversion the timer already started finish */
             (void)ADC1_DR;
             ADC1_SR = 0;                                /* so adc_read(17) waits for its own EOC */
+#endif
+            uint32_t load = 0;                          /* CPU load in 0.01 %: 1250 = 12.50 % */
+            if (idle < idle_base) load = 10000u - idle * 10000u / idle_base;  /* idle stays under 400,000, so this fits in 32 bits */
             uint32_t vref = adc_read(17);
             uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;
 
@@ -288,9 +328,19 @@ int main(void)
             uart_field("t=",        toggles / 100000u);
             uart_field(" vdda_mV=", vdda_mV);
             uart_field(" fs=",      FS);
-            uart_field(" burst=",   burst);
+            uart_field(" mode=",    MODE);
+            uart_field(" idle_base=", idle_base);
+            uart_field(" idle=",    idle);
+            uart_field(" load=",    load);
+#if MODE == 3
             uart_field(" ndtr=",    ndtr);
             uart_field(" dma_err=", dma_err);
+#else
+            uart_field(" missed=",  missed);
+            uart_field(" late_min=", late_min);
+            uart_field(" late_max=", late_max);
+            uart_field(" n_late=",   n_late);
+#endif
             uint32_t now_systicks = systicks;           /* read once: an interrupt can come while the line is sent */
             uart_field(" systicks=", now_systicks - prev_systicks);
             prev_systicks = now_systicks;
