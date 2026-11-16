@@ -1253,3 +1253,127 @@ These single-sample outliers are the Step 8 jumps. In Step 8, at GND and 3V3, yo
 - **Sampling time follows the source.** A generator charges the sampling capacitor quickly, so 56 cycles is plenty. The datasheet formula gives about 33 kΩ as the most source resistance it can handle.
 - **A sine fit makes noise visible.** Subtracting the fitted sine leaves just the error, which showed the Step 8 jumps as isolated single samples going both up and down.
 
+
+## Step 10 — Pace the samples with a hardware timer
+
+**Goal:** take each sample at a time set by a hardware timer instead of "as fast as the loop goes". TIM1 runs continuously at **100 kHz** (one tick every 1,440 CPU cycles). Each tick does two things:
+
+- It drives **PE9** (header **D6**) high: a square wave you can see on the scope. Its rising edge marks **the intended sample time**. Later steps use that edge to measure how late each sample really is (jitter).
+- It sets the flag **CC1IF**. The burst loop from Step 9 now waits for that flag before each conversion.
+
+The CPU still starts each conversion and waits for it (polling). What changes is *when* it starts: on the timer's beat, not straight after the previous one. That makes the sample spacing exact: 10.000 µs, set by the timer and not by how long the code takes. The firmware also counts **missed** ticks: a tick that came while the previous conversion was still running, which means the CPU couldn't keep up.
+
+Later steps reuse this timer: a background interrupt load comes next, then the timer starts conversions in hardware (IRQ and DMA modes).
+
+1. **Wiring.** Keep the generator connected to A0 and CH1 on the generator, as in Step 9. Add **scope CH2** on PE9: push a jumper wire into **D6** (**CN10 pin 4**: the lower header on the right side, with the ST-LINK USB at the top, second row from the top, right-hand column) and another into **GND** (**CN10 pin 5**: third row, left-hand column; the pin right next to D6, pin 3, is AGND, which also works). Clip CH2's probe tip to the D6 wire and its ground clip to the GND wire. Check the labels next to the sockets. Keep the clips off the board and away from the bare pin rows along the edges, as in Step 9. Set CH2's probe switch and menu to match (both 10X), DC coupling, 1 V/div.
+2. **Change `firmware/main.c`.** The rest stays as in Step 9.
+
+   Add the registers, after the ADC ones:
+   ```c
+   #define GPIOE_MODER   (*(volatile uint32_t *)0x40021000)
+   #define GPIOE_OSPEEDR (*(volatile uint32_t *)0x40021008)
+   #define GPIOE_AFRH    (*(volatile uint32_t *)0x40021024)
+   #define TIM1_CR1    (*(volatile uint32_t *)0x40010000)
+   #define TIM1_SR     (*(volatile uint32_t *)0x40010010)
+   #define TIM1_EGR    (*(volatile uint32_t *)0x40010014)
+   #define TIM1_CCMR1  (*(volatile uint32_t *)0x40010018)
+   #define TIM1_CCER   (*(volatile uint32_t *)0x40010020)
+   #define TIM1_PSC    (*(volatile uint32_t *)0x40010028)
+   #define TIM1_ARR    (*(volatile uint32_t *)0x4001002C)
+   #define TIM1_CCR1   (*(volatile uint32_t *)0x40010034)
+   #define TIM1_BDTR   (*(volatile uint32_t *)0x40010044)
+
+   #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
+   ```
+   Turn on the GPIOE clock too. Replace the `RCC_AHB1ENR` line at the top of `main()` with:
+   ```c
+       RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5);  /* GPIOA-F clocks */
+   ```
+   After the 20 µs ADC settling wait, add the timer setup:
+   ```c
+       /* TIM1: the sample clock. Counts 144 MHz ticks from 0 to ARR, over and over */
+       RCC_APB2ENR |= 1u << 0;                             /* TIM1 clock: APB2 is 72 MHz, so timers get 2 x 72 = 144 MHz */
+       (void)RCC_APB2ENR;
+       GPIOE_AFRH    = (GPIOE_AFRH & ~(0xFu << 4)) | (1u << 4);       /* PE9 alternate function 1 = TIM1_CH1 */
+       GPIOE_OSPEEDR |= 3u << 18;                          /* PE9 very high speed: sharp edges for timing */
+       GPIOE_MODER   = (GPIOE_MODER & ~(3u << 18)) | (2u << 18);      /* PE9 = alternate function */
+       TIM1_PSC   = 0;                                     /* count every 144 MHz tick */
+       TIM1_ARR   = 144000000u / FS - 1;                   /* 1440 ticks per period at 100 kHz: count 0..1439 */
+       TIM1_CCR1  = (144000000u / FS) / 2;                 /* compare at the middle: 50% duty */
+       TIM1_CCMR1 = (7u << 4) | (1u << 3);                 /* OC1M = PWM mode 2: PE9 goes high when CNT reaches CCR1; OC1PE */
+       TIM1_CCER  = 1u << 0;                               /* CC1E: drive the pin */
+       TIM1_BDTR  = 1u << 15;                              /* MOE: TIM1 is an "advanced" timer, its outputs stay off without this */
+       TIM1_EGR   = 1u << 0;                               /* UG: load PSC, ARR and CCR1 now */
+       TIM1_CR1   = 1u << 0;                               /* CEN: start counting */
+   ```
+   Replace the body of `if (toggles % 100000u == 0) { ... }` with:
+   ```c
+           if (toggles % 100000u == 0) {                   /* once a second */
+               uint32_t missed = 0, first = 0, last = 0;
+               TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
+                   TIM1_SR = ~(1u << 1);                   /* clear it (writing 0 clears a flag, writing 1 leaves it alone) */
+                   last = DWT_CYCCNT;
+                   if (i == 0) first = last;
+                   samples[i] = (uint16_t)adc_read(3);
+                   if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
+               }
+               uint32_t span = last - first;               /* cycles from the first sample's start to the last's */
+               uint32_t vref = adc_read(17);
+               uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;
+
+               uint32_t lo = 4095, hi = 0;
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   if (samples[i] < lo) lo = samples[i];
+                   if (samples[i] > hi) hi = samples[i];
+               }
+
+               uart_field("t=",        toggles / 100000u);
+               uart_field(" vdda_mV=", vdda_mV);
+               uart_field(" fs=",      FS);
+               uart_field(" span=",    span);
+               uart_field(" missed=",  missed);
+               uart_field(" min=",     lo);
+               uart_field(" max=",     hi);
+               uart_puts("\r\n");
+
+               uart_puts("s=");                            /* all 1,000 samples on one line */
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   if (i) uart_putc(',');
+                   uart_putu(samples[i]);
+               }
+               uart_puts("\r\n");
+           }
+   ```
+   Register notes (RM0090): TIM1 sits on APB2, and because APB2 runs at ÷2, the timer gets twice the bus clock: **144 MHz**. The counter runs 0 … ARR and wraps, so the period is ARR + 1 = **1,440 ticks = 10.000 µs**. In PWM mode 2 the output is low while the count is below CCR1 and high from CCR1 on, so **PE9 rises at the same moment CC1IF is set**: that edge is the sample time. `MOE` is easy to forget: TIM1 is an advanced timer meant for motor control, and its outputs stay disabled until it's set. The status flags are cleared by writing 0, so writing `~(1u << 1)` clears CC1IF and leaves the others alone.
+
+   Predictions:
+   - **`span` = 999 × 1,440 = 1,438,560 cycles**, give or take about 10. The first and last samples are 999 ticks apart, and the ticks come from hardware, so the only error is how quickly the wait loop notices the flag (a few cycles). Unlike Step 9, the code's speed doesn't matter.
+   - **`missed` = 0.** One `adc_read()` takes about 364 cycles (Step 9), well inside the 1,440-cycle period.
+   - The burst now lasts **10 ms**: 20 cycles of the 2 kHz sine, 50 samples per cycle.
+3. **Change `analysis/burst.py`** so it takes the sample spacing from the timer rate when the board sends one. In `main()`, replace from `burst = int(header["burst"])` to the line before `print(f"min ...")` with:
+   ```python
+       if "fs" in header:                              # Step 10 on: samples paced by TIM1
+           dt = 1 / int(header["fs"])
+           print(f"burst: {len(s)} samples at {int(header['fs']) / 1e3:g} kHz ({dt * 1e6:.3f} us apart), "
+                 f"span {header['span']} cycles, missed {header['missed']}, VDDA {vdda} mV")
+       else:                                           # Step 9: back to back, spacing from the burst time
+           burst = int(header["burst"])
+           dt = burst / len(s) / CPU_HZ
+           print(f"burst: {len(s)} samples in {burst} cycles = {burst / CPU_HZ * 1e3:.3f} ms, "
+                 f"{dt * 1e6:.3f} us apart ({1 / dt / 1e3:.1f} kHz), VDDA {vdda} mV")
+       mv = s * vdda / 4095
+       t = np.arange(len(s)) * dt
+
+   ```
+4. From `firmware/`: `make`, then `make flash`. On the scope, **CH2 (PE9)**: All Measure with source CH2, or Measure → Frequency and Duty for CH2. Then from the repo root: `python3 analysis/burst.py --plot docs/step10-sine.png`, a few times.
+5. **Optional, to see what "missed" looks like:** set `FS` to **500000u** (288 cycles per period, still dividing 144 MHz exactly), rebuild and flash, and run the script. The ADC alone could keep up, since a 56-cycle conversion is 272 CPU cycles. But `adc_read()` and the loop add about 90–100 more, so each sample takes longer than a period. Expect `missed` close to **1,000**, and `span` well above 999 × 288 = 287,712: the loop runs at its own speed again, about 999 × 380 ≈ 380,000, and the script's frequency comes out wrong because the real spacing isn't 2 µs. Set `FS` back to 100000u afterwards. Getting past this limit is what IRQ and DMA modes are for.
+
+**Done when:**
+- **CH2 on PE9** shows a 0–3.3 V square wave at **100.000 kHz** with **50%** duty.
+- Every line shows **`span` = 1,438,560** cycles, within about ±10, and **`missed=0`**.
+- The script's **frequency** is within **0.1%** of 2 kHz. Board and generator now both keep time from crystals, so it should land much closer than that. Amplitude and offset match Step 9: peak-to-peak within 3% of the scope's, offset within 50 mV.
+- The plot shows 20 clean cycles of the sine.
+
+Write down the CH2 frequency and duty, the range of `span`, `missed`, and the script's frequency, amplitude, offset and residual. Save the plot.
