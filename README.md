@@ -1801,3 +1801,110 @@ It comes with interrupt mode itself, not with the LA, its USB ground or the SysT
 - **Priority decides jitter.** Moving acquisition from below SysTick to above it took the worst lateness from 2.50 µs to 56 ns, with no other code change. Polling can't do that, because a polling loop can never interrupt an interrupt.
 - **Clear the interrupt flag first thing in the handler.** Otherwise the interrupt fires again as soon as the handler returns.
 - **Change one thing at a time to find a cause.** Swapping the LA, the firmware and the load one by one tied the 400–500 Hz wave to interrupt mode, and ruled out the wiring.
+
+
+## Step 13 — DMA mode: the CPU leaves the sampling path
+
+**Goal:** take the CPU out of every sample. In Step 12 the CPU still ran two interrupt handlers per sample, so anything that delayed them delayed the sample. Now the hardware does the whole job:
+
+- **TIM1 starts each conversion.** The ADC's **external trigger** is set to TIM1's CC1 event, the same moment PE9 goes high. No interrupt, no SWSTART.
+- **DMA2 collects each result.** After every conversion the ADC raises a **DMA request**, and DMA2 stream 0 copies `ADC1_DR` into the next slot of `samples[]`. DMA (direct memory access) is a separate bus master: it moves data between peripherals and memory while the CPU does something else.
+- **The CPU only notices the end.** After 1,000 transfers the stream sets **TCIF0** (transfer complete). `main()` waits for that one flag.
+
+So the sample instant is now **the TIM1 edge plus a fixed hardware delay**, and nothing the CPU does can move it. TIM1 counts 1,440 timer clocks per sample. The ADC clock (36 MHz) is a quarter of the timer clock, and 1,440 is a multiple of 4, so every trigger also lands at the same point in the ADC's clock. That leaves only the jitter of the clock itself, which `TIM1_CNT` can't measure. This step looks at it on the scope instead.
+
+To show that the CPU no longer matters, this step runs with SysTick at the **highest** priority, the setting that gave 2.5 µs of lateness in Step 12. Then it makes the load 50 times heavier.
+
+Which DMA stream? Each peripheral's requests go to fixed streams and channels (RM0090 Table 43). ADC1 is on DMA2 **stream 0, channel 0** (or stream 4, channel 0).
+
+1. **Wiring.** No change from Step 12: generator on A0, scope CH1 on the generator, scope **CH2 on PE9** (D6). The LA isn't needed.
+2. **Change `firmware/main.c`.** The Step 12 interrupt handlers stay, but they no longer run: nothing turns on CC1IE or EOCIE now. Step 14 brings polling, interrupts and DMA together behind one switch.
+
+   Add the DMA2 registers, after `#define TIM1_CC_IRQ 27`:
+   ```c
+   #define DMA2_LISR   (*(volatile uint32_t *)0x40026400)
+   #define DMA2_LIFCR  (*(volatile uint32_t *)0x40026408)
+   #define DMA2_S0CR   (*(volatile uint32_t *)0x40026410)
+   #define DMA2_S0NDTR (*(volatile uint32_t *)0x40026414)
+   #define DMA2_S0PAR  (*(volatile uint32_t *)0x40026418)
+   #define DMA2_S0M0AR (*(volatile uint32_t *)0x4002641C)
+   ```
+   Put SysTick first: set `ACQ_PRIO` to `1u` and `SYSTICK_PRIO` to `0u`. `LOAD` stays 1.
+
+   Turn on the DMA2 clock. Change the `RCC_AHB1ENR` line at the top of `main()` to:
+   ```c
+       RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 22);  /* GPIOA-F and DMA2 clocks */
+   ```
+   In the once-a-second block, replace everything from `n_started = 0; n_done = 0; missed = 0;` up to (not including) `uint32_t vref = adc_read(17);` with:
+   ```c
+               DMA2_LIFCR  = 0x3Du;                        /* clear stream 0's flags from the last burst */
+               DMA2_S0NDTR = NSAMP;                        /* move 1,000 results */
+               DMA2_S0PAR  = (uint32_t)&ADC1_DR;           /* from the ADC's data register */
+               DMA2_S0M0AR = (uint32_t)samples;            /* to samples[] */
+               DMA2_S0CR   = (1u << 13) | (1u << 11) | (1u << 10);  /* channel 0 (ADC1), 16 bits each side, step the memory address */
+               DMA2_S0CR  |= 1u << 0;                      /* EN: stream on, waiting for requests */
+               ADC1_SQR3   = 3;                            /* A0 */
+               ADC1_SR     = 0;                            /* clear EOC and OVR */
+               ADC1_CR2   |= 1u << 8;                      /* DMA: a request after every conversion */
+               uint32_t t_start = DWT_CYCCNT;
+               ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising: the timer starts each conversion */
+               while (!(DMA2_LISR & (1u << 5))             /* TCIF0: all 1,000 moved */
+                      && DWT_CYCCNT - t_start < 2u * NSAMP * PERIOD) {}  /* give up after twice the expected time */
+               uint32_t burst = DWT_CYCCNT - t_start;
+               ADC1_CR2   &= ~((3u << 28) | (1u << 8));    /* trigger off, DMA off */
+               uint32_t ndtr = DMA2_S0NDTR;                /* results not moved: 0 if the burst completed */
+               uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0: transfer or direct-mode errors */
+               DMA2_S0CR  &= ~(1u << 0);                   /* stream off (already off if it completed) */
+               uint32_t t1 = DWT_CYCCNT;
+               while (DWT_CYCCNT - t1 < 300u) {}           /* let a conversion the timer already started finish */
+               (void)ADC1_DR;
+               ADC1_SR = 0;                                /* so adc_read(17) waits for its own EOC */
+   ```
+   In the line, replace everything from `uart_field(" span=", ...)` through `uart_field(" n_late=", ...)` with:
+   ```c
+               uart_field(" burst=",   burst);
+               uart_field(" ndtr=",    ndtr);
+               uart_field(" dma_err=", dma_err);
+               uint32_t now_systicks = systicks;           /* read once: an interrupt can come while the line is sent */
+               uart_field(" systicks=", now_systicks - prev_systicks);
+               prev_systicks = now_systicks;
+   ```
+   Register notes (RM0090):
+   - **`DMA2_S0CR`**: `CHSEL` (bits 27:25) = 0 picks channel 0, the ADC1 request. `DIR` = 00 is peripheral to memory. `PSIZE` and `MSIZE` = 01 are 16-bit reads and writes: the ADC result fits in 16 bits, and `samples[]` is `uint16_t`. `MINC` steps the memory address by 2 after each transfer, while the peripheral address stays on `ADC1_DR`. `NDTR` counts down once per transfer; at 0 the stream sets TCIF0 and turns itself off.
+   - **`DMA2_LIFCR`**: stream 0's flags can only be cleared here. `0x3D` clears all of them: FEIF0, DMEIF0, TEIF0, HTIF0 and TCIF0.
+   - **`ADC1_CR2`**: `EXTSEL` (bits 27:24) = 0000 is TIM1's CC1 event, and `EXTEN` (bits 29:28) = 01 starts a conversion on its rising edge. `DMA` (bit 8) makes the ADC raise a request after each conversion. With `DDS` = 0 (the reset value), it stops raising them after the DMA's last transfer. To start again, the code clears `DMA` and sets it again, as here at the end and start of each burst.
+   - **Why stop the trigger and wait 300 cycles.** TIM1 keeps ticking. If one more conversion starts before the trigger is turned off, it would finish during `adc_read(17)` and hand that function an A0 result instead of VREFINT. One conversion takes 272 cycles.
+   - **`ndtr` replaces `missed`.** If the CPU or a bus conflict ever made the DMA too slow, the ADC would set OVR and stop sending requests. The stream would then never reach 0, the wait would give up after 20 ms, and `ndtr` would show how many results were missing.
+3. **Change `analysis/burst.py`** so it prints whichever of these fields the board sends. Replace the `print(...)` in the `if "fs" in header:` branch with:
+   ```python
+           extra = ", ".join(f"{k} {header[k]}" for k in ("span", "missed", "burst", "ndtr", "dma_err") if k in header)
+           print(f"burst: {len(s)} samples at {int(header['fs']) / 1e3:g} kHz ({dt * 1e6:.3f} us apart), "
+                 f"{extra}, VDDA {vdda} mV")
+   ```
+4. From `firmware/`: `make`, `make flash`. Watch about 30 s of lines:
+   `stty -F /dev/ttyACM0 115200 raw -echo; grep -a --line-buffered '^t=' /dev/ttyACM0`
+   Then from the repo root: `python3 analysis/burst.py --plot docs/step13-sine.png`, three times.
+5. **Heavier load.** Set `LOAD_CYCLES` to **`14400u`**: 100 µs out of every millisecond, 10% of the CPU. `make`, `make flash`, watch 30 s of lines and run `burst.py` three times (no `--plot`). In Step 12 with SysTick first, a 100 µs interrupt would cover 10 sample ticks. CC1IF is a single flag, so about 9 of them would be lost each time it hit. Set `LOAD_CYCLES` back to `288u` afterwards.
+6. **Clock jitter on the scope.** This shows how evenly PE9's edges, the sample instants, are spaced.
+   1. Trigger on **CH2, rising edge**, level about 1.6 V.
+   2. Set H to **2 ns/div** and D to **10.000 µs**, so the screen shows the *next* rising edge after the one the scope triggered on.
+   3. Turn on infinite persistence: **[Display] → Persist → Infinite**. Every new edge is drawn on top of the old ones, so the edge becomes a band as wide as its jitter.
+   4. After about 30 s, measure the band's width at mid-height with the time cursors (AX on its left side, BX on its right).
+
+   The scope's own trigger jitter adds to whatever the board does, so this gives an upper limit, not an exact value.
+
+Predictions:
+- **`ndtr=0` and `dma_err=0`** on every line, at both loads.
+- **`burst`** is 999 × 1,440 = 1,438,560 cycles, plus up to one period waiting for the first tick, plus the last conversion (about 272): **about 1,438,850–1,440,300**. TIM1 and the once-a-second deadline both count the same 144 MHz clock, so the wait for the first tick barely changes from line to line. SysTick can delay `main()` noticing TCIF0, adding up to about 320 cycles at the light load and up to 14,400 at the heavy one. That only changes when `main()` sees the flag, not when any sample was taken.
+- **`systicks` = 1000** (sometimes 999) at both loads.
+- **`burst.py`:** frequency within 0.1% of 2 kHz, peak-to-peak and offset as in Step 12, **at both loads**. In Step 12 the same load with SysTick first made samples 2.5 µs late.
+- **PE9 edge band:** at most about **1 ns** wide, which is about what the scope itself can resolve.
+- Look at the residual in the plot as well: is the 400–500 Hz wave from Step 12 there? In DMA mode the CPU waits by reading `DMA2_LISR`, while the ADC is converting.
+
+**Done when:**
+- `ndtr=0`, `dma_err=0` and `systicks` 1000 (sometimes 999) on every line, at both loads.
+- `burst` steady from line to line at the light load, and within about 14,400 of that at the heavy load.
+- `burst.py` passes at both loads: frequency within 0.1% of 2 kHz, peak-to-peak and offset as in Step 12, 20 clean cycles in the plot.
+- The scope shows the PE9 edge band and you've measured its width.
+
+Write down the range of `burst` at each load, the script's frequency, amplitude, offset and residual at each load, the PE9 band width, and whether the 400–500 Hz wave is in the plot.
