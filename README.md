@@ -2178,3 +2178,145 @@ A likely explanation, not yet tested: in polling, the CPU does exactly the same 
 - **Compare against a baseline taken the same way.** `idle_base` uses the same loop and the same window, so the loop's own speed (21 cycles per pass, not the 12 predicted) cancels out.
 - **DMA doesn't have to slow the CPU.** The bus matrix lets the CPU and DMA2 use different RAM blocks at once, and here the DMA cost the loop nothing.
 - **Running the modes back to back is a fair test.** The same hardware, wiring and minutes showed the 400–500 Hz wave following the mode, which one run at a time couldn't.
+
+
+## Step 15 — Maximum sustained sample rate
+
+**Goal:** find the fastest rate each mode can keep up with. The benchmark's last number is how much faster DMA can sample than interrupts.
+
+**"Keeps up" means:** at a given `FS`, all 1,000 samples are taken on their own ticks, on every line. Each mode already counts what goes wrong:
+- **Polling and interrupts:** `missed`, a tick that came before the previous sample was finished.
+- **DMA:** a trigger that arrives while the ADC is still converting is ignored, so that sample is never taken. The burst then takes longer than 1,000 ticks. `idle_loop()`'s window is the burst plus 2 periods, so this step reads `NDTR` **right when the window ends**: if every trigger was used, it's 0.
+
+To sweep rates quickly, `make` takes `MODE` and `FS` from the command line, and a script flashes each rate in turn and checks 15 lines.
+
+**The ADC has to get faster first.** At 56 sampling cycles one conversion takes 68 ADC cycles = 272 CPU cycles, which caps any mode at 529 kHz. At **3 cycles**, the shortest, it's 15 ADC cycles = **60 CPU cycles**, so **2.4 MSPS**: the ADC's rated maximum at 36 MHz. Is 3 cycles enough for the generator? The Step 9 formula says no source can fully charge the sampling capacitor in 3 cycles, starting from empty, to 12-bit accuracy. But here the capacitor isn't starting from empty: it holds the previous sample of the same signal. With 50 samples per cycle of the sine, consecutive samples differ by at most 2π × 1 V / 50 ≈ 126 mV. The ADC's internal resistance and capacitor (about 6 kΩ × 4 pF = 24 ns) settle for 83 ns, about 3.5 time constants, which leaves about 3% *of that difference*: up to about 4 mV, comparable to the noise. Substep 4 checks that the sine still measures the same.
+
+All runs use the light load (`LOAD_CYCLES 288u`) and acquisition first, as in Step 14. With the load on, the rates found are the ones a busy CPU can actually sustain.
+
+1. **Wiring.** No change: generator on A0, scope CH1 on the generator.
+2. **Change `firmware/Makefile`** to:
+   ```make
+   CC      = arm-none-eabi-gcc
+   CFLAGS  = -mcpu=cortex-m4 -mthumb -Wall -g
+   LDFLAGS = -nostdlib -T stm32f429zi.ld
+   SRCS    = startup.c main.c
+   # make MODE=2 FS=500000 builds with those instead of the values in main.c
+   DEFS    = $(if $(MODE),-DMODE=$(MODE)) $(if $(FS),-DFS=$(FS)u)
+
+   build/fw.elf: $(SRCS) stm32f429zi.ld Makefile
+   	mkdir -p build
+   	$(CC) $(CFLAGS) $(DEFS) $(LDFLAGS) $(SRCS) -o $@
+   	arm-none-eabi-size $@
+
+   flash: build/fw.elf
+   	STM32_Programmer_CLI -c port=SWD -w $< -v -rst
+
+   clean:
+   	rm -rf build
+
+   # build/fw.elf is phony so it's always rebuilt: MODE and FS may have changed
+   .PHONY: build/fw.elf flash clean
+   ```
+   `$(if $(MODE),-DMODE=$(MODE))` adds `-DMODE=2` only when you pass `MODE=2`. `-D` defines a macro as if the file had `#define MODE 2`.
+3. **Change `firmware/main.c`.**
+
+   Let the command line override `FS` and `MODE`, and refuse a rate that doesn't divide 144 MHz. Replace the `#define FS` line with:
+   ```c
+   #ifndef FS                                              /* make FS=500000 overrides this */
+   #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
+   #endif
+   #if 144000000u % FS != 0
+   #error "FS must divide 144 MHz exactly, e.g. 100000, 200000, 600000, 2400000"
+   #endif
+   ```
+   and the `#define MODE` line with:
+   ```c
+   #ifndef MODE                                            /* make MODE=1 overrides this */
+   #define MODE 3                                          /* 1 = polling, 2 = interrupts, 3 = DMA */
+   #endif
+   ```
+   Shorten A0's sampling time. Replace the `ADC1_SMPR2` line with:
+   ```c
+       ADC1_SMPR2 &= ~(7u << 9);                           /* channel 3: sample for 3 ADC cycles: 15 per conversion, up to 2.4 MSPS */
+   ```
+   In the DMA branch, read `NDTR` as soon as the window ends. After `idle = idle_loop(WINDOW);`, add:
+   ```c
+               uint32_t ndtr = DMA2_S0NDTR;                /* results still to come: 0 unless a trigger was skipped */
+   ```
+   and delete the later line `uint32_t ndtr = DMA2_S0NDTR;  /* results not moved: ... */`. The wait for TCIF0 stays, so the burst still finishes before the DMA is turned off.
+4. **Check 3-cycle sampling at 100 kHz** before going faster. From `firmware/`: `make flash` (MODE 3, FS 100000 from `main.c`). From the repo root, run `python3 analysis/burst.py` three times: peak-to-peak and offset should match Step 14's DMA run within 3% and 50 mV.
+5. **Add `analysis/sweep.py`:**
+   ```python
+   #!/usr/bin/env python3
+   """Step 15: flash one MODE at several sample rates and check that each one keeps up."""
+   import argparse
+   import subprocess
+
+   import serial
+
+   def lines_from_board(port, n):
+       """Return the header fields of n complete 't=' lines, skipping the first (it may be cut off)."""
+       out = []
+       with serial.Serial(port, 115200, timeout=5) as ser:
+           ser.reset_input_buffer()
+           ser.readline()
+           while len(out) < n:
+               line = ser.readline().decode(errors="replace").strip()
+               if not line:
+                   raise SystemExit("no data from the board")
+               if line.startswith("t="):
+                   try:
+                       out.append(dict(kv.split("=") for kv in line.split()))
+                   except ValueError:
+                       pass                                # cut-off line: skip it
+       return out
+
+   def main():
+       ap = argparse.ArgumentParser()
+       ap.add_argument("mode", type=int, choices=(1, 2, 3))
+       ap.add_argument("fs", type=int, nargs="+", help="sample rates in Hz; each must divide 144 MHz")
+       ap.add_argument("--lines", type=int, default=15, help="lines to check per rate (one a second)")
+       ap.add_argument("--port", default="/dev/ttyACM0")
+       args = ap.parse_args()
+
+       key = "ndtr" if args.mode == 3 else "missed"
+       print(f"MODE {args.mode}, {args.lines} lines per rate; a rate passes if {key}=0 on every line")
+       print(f"{'fs (kHz)':>9} {'cycles':>6} {'worst ' + key:>12} {'load %':>13} {'late_max':>9}  result")
+       for fs in args.fs:
+           subprocess.run(["make", "-C", "firmware", "flash", f"MODE={args.mode}", f"FS={fs}"],
+                          check=True, capture_output=True)
+           rows = lines_from_board(args.port, args.lines)
+           worst = max(int(r[key]) for r in rows)
+           loads = [int(r["load"]) / 100 for r in rows]
+           late = max(int(r["late_max"]) for r in rows) if args.mode != 3 else None
+           print(f"{fs / 1e3:9g} {144_000_000 // fs:6d} {worst:12d} {min(loads):6.2f}-{max(loads):<6.2f} "
+                 f"{'-' if late is None else late:>9}  {'pass' if worst == 0 else 'FAIL'}")
+
+   if __name__ == "__main__":
+       main()
+   ```
+   It runs `make -C firmware flash MODE=... FS=...` for each rate, reads 15 lines, and prints one row per rate.
+6. **Sweep each mode** from the repo root. Each rate takes about 25 s.
+   ```
+   python3 analysis/sweep.py 1 200000 300000 400000 600000
+   python3 analysis/sweep.py 2 400000 600000 800000
+   python3 analysis/sweep.py 3 1000000 2000000 2400000 3000000
+   ```
+   3 MHz is above the ADC's limit. It's there to show what failing looks like in DMA mode.
+7. **Check the samples at each mode's highest passing rate.** Set the generator to **FS / 50**, so 1,000 samples hold 20 cycles as before. That's 4 kHz for 200 kHz, 12 kHz for 600 kHz and 48 kHz for 2.4 MHz, still 2 Vpp at 1.65 V offset. From `firmware/`, run `make flash MODE=... FS=...`, then from the repo root run `python3 analysis/burst.py --plot docs/step15-mode<N>.png` once. Afterwards set the generator back to 2 kHz and run `make flash` with no arguments, to go back to MODE 3 at 100 kHz.
+
+Predictions (all with the light load, built at `-O0`):
+- **Step 4:** the sine at 100 kHz looks the same as at 56 cycles.
+- **Polling, about 200 kHz.** One sample now takes about 220 cycles: about 150 for `adc_read()` (60 to convert plus about 90 of overhead, as in Step 9) and about 70 for the wait, the counter read and the lateness sums. Without the load that would allow 600 kHz (240 cycles). But a sample delayed by SysTick starts up to about 366 cycles late and finishes about 590 cycles after its tick. Below 720 cycles (200 kHz) the next tick arrives first, so `missed` > 0 on the lines where SysTick hits. Those come in pairs about every 7 lines, so 15 lines will catch them.
+- **Interrupts, about 600 kHz.** Step 14 measured about 210 CPU cycles per sample in the two handlers. With acquisition first, SysTick can't delay them. At 240 cycles (600 kHz) both handlers finish before the next tick, with `load` around 85–90%. At 180 cycles (800 kHz) they can't.
+- **DMA, 2.4 MHz.** The CPU isn't involved, so the ADC's 60 cycles per conversion is the only limit, and 60 cycles is exactly 2.4 MHz. `load` stays about 0. At 3 MHz (48 cycles) a trigger comes while the previous conversion is still running and is ignored: about every other one. So expect `ndtr` about 500 at the end of the window.
+- **Step 7:** each max-rate sine at FS / 50 gives a frequency within 0.1% of the generator's, peak-to-peak within 3% of 2 V.
+- **The benchmark's last two numbers:** DMA ÷ interrupts ≈ 2.4 MHz ÷ 600 kHz = **4×**, at **2.4 MSPS**. Polling and interrupts would go faster at `-O2`, but DMA can't: its limit is the ADC.
+
+**Done when:**
+- Step 4: peak-to-peak and offset within 3% and 50 mV of Step 14's DMA values.
+- Each sweep shows the highest `FS` that passes on all 15 lines, and the next rate up failing.
+- `burst.py` at each mode's highest passing rate: frequency within 0.1% of the generator's, peak-to-peak within 3% of the scope's.
+
+Write down each sweep table, and the three `burst.py` results with their plots.
