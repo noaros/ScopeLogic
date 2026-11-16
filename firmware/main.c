@@ -38,6 +38,9 @@
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
 uint32_t toggles;                                       /* .bss: starts at 0 */
 
+#define NSAMP 1000
+uint16_t samples[NSAMP];                                /* .bss: 2,000 bytes for one burst */
+
 /* Send one byte: wait until the transmitter can take it (TXE), then hand it over */
 static void uart_putc(char c)
 {
@@ -129,7 +132,7 @@ int main(void)
     (void)RCC_APB2ENR;
     GPIOA_MODER |= 3u << 6;                             /* PA3 = analog */
     ADC_CCR = (ADC_CCR & ~(3u << 16)) | (1u << 23);     /* ADCPRE = /2: 72 MHz APB2 -> 36 MHz ADC clock; TSVREFE: VREFINT on */
-    ADC1_SMPR2 |= 7u << 9;                              /* channel 3: sample for 480 ADC cycles */
+    ADC1_SMPR2 = (ADC1_SMPR2 & ~(7u << 9)) | (3u << 9);  /* channel 3: sample for 56 ADC cycles */
     ADC1_SMPR1 |= 7u << 21;                             /* channel 17: 480 cycles (VREFINT needs at least 10 us) */
     ADC1_CR2   |= 1u << 0;                              /* ADON: power up the ADC */
     uint32_t t0 = DWT_CYCCNT;
@@ -142,22 +145,32 @@ int main(void)
         GPIOF_BSRR = (GPIOF_ODR & (1u << 15)) ? 1u << (15 + 16) : 1u << 15;  /* flip PF15 */
         toggles++;
 
-        if (toggles % 100000u == 0) {                   /* 100,000 flips = once a second */
-            uint32_t c0   = DWT_CYCCNT;
-            uint32_t a0   = adc_read(3);
-            uint32_t conv = DWT_CYCCNT - c0;            /* cycles one conversion took */
+        if (toggles % 100000u == 0) {                   /* once a second */
+            uint32_t c0 = DWT_CYCCNT;
+            for (uint32_t i = 0; i < NSAMP; i++)
+                samples[i] = (uint16_t)adc_read(3);     /* back to back: no gaps between conversions */
+            uint32_t burst = DWT_CYCCNT - c0;           /* cycles for the whole burst */
             uint32_t vref = adc_read(17);
-            uint32_t cal  = VREFINT_CAL;
-            uint32_t vdda_mV = vref ? 3300u * cal / vref : 0;  /* real supply: VREFINT read low = supply high */
-            uint32_t a0_mV   = a0 * vdda_mV / 4095u;
+            uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;
+
+            uint32_t lo = 4095, hi = 0;
+            for (uint32_t i = 0; i < NSAMP; i++) {
+                if (samples[i] < lo) lo = samples[i];
+                if (samples[i] > hi) hi = samples[i];
+            }
 
             uart_field("t=",        toggles / 100000u);
-            uart_field(" a0=",      a0);
-            uart_field(" a0_mV=",   a0_mV);
-            uart_field(" vref=",    vref);
-            uart_field(" cal=",     cal);
             uart_field(" vdda_mV=", vdda_mV);
-            uart_field(" conv=",    conv);
+            uart_field(" burst=",   burst);
+            uart_field(" min=",     lo);
+            uart_field(" max=",     hi);
+            uart_puts("\r\n");
+
+            uart_puts("s=");                            /* all 1,000 samples on one line */
+            for (uint32_t i = 0; i < NSAMP; i++) {
+                if (i) uart_putc(',');
+                uart_putu(samples[i]);
+            }
             uart_puts("\r\n");
         }
     }

@@ -1025,7 +1025,7 @@ Two things change on the ADC side:
 - **A0's sampling time drops from 480 to 56 ADC cycles.** A generator can charge the sampling capacitor much faster than VREFINT can, so 480 cycles would only make each conversion slower (see the Step 8 lessons). VREFINT keeps its 480 cycles.
 - **One reading a second becomes 1,000 readings in about 2.6 ms.** That's enough to see the waveform, and also the A0 jumps from Step 8, sample by sample.
 
-1. **Set the generator, and check it on the scope before it goes anywhere near the board.** Generator: **sine, 2 kHz, 2 Vpp, offset +1.65 V**. Connect a BNC-to-clip lead to the generator output and clip scope CH1's probe onto it: tip on the red clip, probe ground on the black clip. Leave the board unconnected for now. Measure on CH1 (DC coupling):
+1. **Set the generator, and check it on the scope before it goes anywhere near the board.** Generator: **sine, 2 kHz, 2 Vpp, offset +1.65 V**, and **Impedance: High Z**. On the DSO2D15 that's the **[Wave Gen]** menu. The manual gives the Impedance default as 50 Ω. Set to 50 Ω, the output into a high-impedance load like CH1 or A0 is about double what the screen says. Pressing a setting's soft key again switches the knob to fine steps. The output is the **EXT TRIG/GEN OUT** BNC. Connect a BNC-to-clip lead to it and clip scope CH1's probe onto it: tip on the red clip, probe ground on the black clip. Leave the board unconnected for now. Measure on CH1 (DC coupling):
    - It should swing from about **0.65 V to 2.65 V**: 2.0 Vpp, 1.65 V mean, 2.000 kHz.
    - If it shows about **1.3 to 4.0 V**, the generator assumes a 50 Ω load and is putting out double. Halve the amplitude and the offset, and check again. **Never connect a signal above 3.3 V or below 0 V to A0.**
    - Write down the Vpp, mean and frequency the scope measures. Those are the numbers to compare with.
@@ -1204,3 +1204,52 @@ Two things change on the ADC side:
 - The plot shows a clean sine, and the residual rms is a few mV. Spikes like the Step 8 jumps would show up here as single points far from the fit: write down how many there are and how big.
 
 Write down the scope's Vpp, mean and frequency; `burst`; and the script's frequency, amplitude, offset and residual. Save the plot.
+
+**Measured:**
+
+Scope, CH1 on the generator before connecting (**[Meas] → All Measure**, which calls them Pk-Pk and Average): **Pk-Pk 1.94 V, Average 1.67 V, Frequency 2 kHz, Max 2.62 V, Min 0.68 V**. With the board connected, Pk-Pk read 2.0 V.
+
+Board, generator connected straight to A0. Three runs of `analysis/burst.py`:
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| `burst` (cycles) | 364,027 | 364,027 | 364,026 |
+| Frequency | 2000.0 Hz | 2000.3 Hz | 2000.0 Hz |
+| Fitted peak-to-peak | 1988 mV | 1985 mV | 1987 mV |
+| Fitted offset | 1646 mV | 1645 mV | 1645 mV |
+| Residual rms / worst | 15.8 / 92 mV | 14.5 / 84 mV | 14.2 / 78 mV |
+
+- `burst` is **364,026–364,027 cycles**, 2.528 ms, so the samples are **2.528 µs apart (395.6 kHz)**. That's 3% under the 375,000 predicted: the overhead per reading is about 92 cycles beyond the 272 for the conversion, not the ~100 I estimated.
+- Frequency, peak-to-peak and offset all pass. Peak-to-peak is within 3% of the scope's reading, and the offset is 21–25 mV below the scope's Average.
+- The residual does **not** pass the "a few mV" check. It has two parts. Every sample has a spread of about **10 mV rms**. On top of that, in three further bursts **49–67 of 1,000 samples (5–7%)** were off by **30–90 mV**, typically about 40 mV, about as many up as down. They're almost always **single samples**: only 0–3 times did two land next to each other.
+
+![A0 burst: 1,000 samples of the 2 kHz sine with the fitted sine, and the residual below](docs/step9-sine.png)
+
+These single-sample outliers are the Step 8 jumps. In Step 8, at GND and 3V3, you could only see them going one way, because a reading can't go below 0 or above 4095. In mid-range they show up in both directions. During the burst PF15 isn't toggling and the UART is idle, so they probably don't come from the board's own activity. The USB/ST-LINK, or the ground connection now shared with the scope, are more likely. Carried forward as an open item.
+
+### Step 9 summary
+
+**Step 9 captured a 2 kHz sine from the scope's generator with 1,000 back-to-back ADC readings. Frequency, amplitude and offset match the scope, but 5–7% of samples carry single-sample errors of 30–90 mV.**
+
+**What changed:**
+1. **A0 sampling time** went from 480 to 56 ADC cycles, so one conversion takes 1.89 µs. VREFINT keeps 480.
+2. **Once a second:** a burst of 1,000 polled `adc_read(3)` calls into `samples[]`, timed with the cycle counter, then one line with `vdda_mV`, `burst`, `min` and `max`, and one `s=` line with all the samples.
+3. **`analysis/burst.py`:** reads one burst, measures the frequency from the rising crossings, fits a sine for amplitude and offset, reports the residual and saves a plot.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| Generator on CH1, before connecting | 0.65–2.65 V, 2 kHz | 0.68–2.62 V, Pk-Pk 1.94 V, Average 1.67 V, 2 kHz |
+| `burst` | about 375,000 cycles, steady | 364,026–364,027 |
+| Frequency | 2 kHz ± 1% | 2000.0–2000.3 Hz |
+| Peak-to-peak | within 3% of the scope | 1985–1988 mV |
+| Offset | within 50 mV of the scope | 1645–1646 mV |
+| Residual | a few mV rms | 14–16 mV rms: 10 mV spread plus 5–7% single-sample outliers of 30–90 mV |
+
+**What you learned along the way:**
+- **Check the generator on the scope first, and its Impedance setting.** Set to 50 Ω, a generator puts about double the voltage on screen into a high-impedance input. The manual gives 50 Ω as the default. Set it to High Z, and let the CH1 reading confirm the voltage.
+- **Read the time base before reading the wave.** At 10 ns/div a 2 kHz sine looks like a small flat squiggle, and Frequency shows "*****". On the DSO2D15, H at the top of the screen is time per division and D is the delay.
+- **Sampling time follows the source.** A generator charges the sampling capacitor quickly, so 56 cycles is plenty. The datasheet formula gives about 33 kΩ as the most source resistance it can handle.
+- **A sine fit makes noise visible.** Subtracting the fitted sine leaves just the error, which showed the Step 8 jumps as isolated single samples going both up and down.
+
