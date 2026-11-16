@@ -1015,3 +1015,192 @@ The floating value probably stays near 0.78 V because a floating pin holds its c
 - **With the longest sampling time, which VREFINT needs, a conversion is mostly sampling.** A conversion is the sampling time (3 to 480 ADC cycles, set in `SMPR1`/`SMPR2`) plus 12 cycles to work out the 12 bits. We used 480 for both channels because VREFINT needs at least 10 µs of sampling, so 480 of the 492 cycles go on charging the sampling capacitor: 13.67 µs at 36 MHz, or about 2,000 CPU cycles of waiting while polling. A strong source like a signal generator can be sampled for just 3 cycles (0.42 µs per conversion); a weak one needs longer for the capacitor to charge to within half a count.
 - **Ground isn't one voltage.** Tying A0 to a different GND pin changed the error by four times. The internal reference never goes through a header pin, so it stayed steady.
 - **One reading a second only shows that something is wrong.** It can't show what the jumps look like or when they happen. Faster sampling, coming later, can.
+
+## Step 9 — Capture a sine wave from the signal generator
+
+**Goal:** feed a known signal into A0 and check that the ADC sees it correctly. The scope's built-in generator makes a **2 kHz sine from 0.65 to 2.65 V**. Once a second the board takes a **burst of 1,000 conversions back to back** and sends them over the UART, and a Python script on the PC measures the sine's frequency, amplitude and offset. You compare those with what the scope measures on the same signal.
+
+Two things change on the ADC side:
+
+- **A0's sampling time drops from 480 to 56 ADC cycles.** A generator can charge the sampling capacitor much faster than VREFINT can, so 480 cycles would only make each conversion slower (see the Step 8 lessons). VREFINT keeps its 480 cycles.
+- **One reading a second becomes 1,000 readings in about 2.6 ms.** That's enough to see the waveform, and also the A0 jumps from Step 8, sample by sample.
+
+1. **Set the generator, and check it on the scope before it goes anywhere near the board.** Generator: **sine, 2 kHz, 2 Vpp, offset +1.65 V**. Connect a BNC-to-clip lead to the generator output and clip scope CH1's probe onto it: tip on the red clip, probe ground on the black clip. Leave the board unconnected for now. Measure on CH1 (DC coupling):
+   - It should swing from about **0.65 V to 2.65 V**: 2.0 Vpp, 1.65 V mean, 2.000 kHz.
+   - If it shows about **1.3 to 4.0 V**, the generator assumes a 50 Ω load and is putting out double. Halve the amplitude and the offset, and check again. **Never connect a signal above 3.3 V or below 0 V to A0.**
+   - Write down the Vpp, mean and frequency the scope measures. Those are the numbers to compare with.
+2. **Wiring.** Keep CH1 clipped on. Black clip to a **GND** pin on the board. Red clip to **A0** through a **1 kΩ resistor** if you have one: if the signal is ever set wrong, the resistor limits the current into the pin. Any resistor from 1 kΩ to 4.7 kΩ works. Without one, connect straight to A0, but only after substep 1 checked out.
+
+   The ST datasheet (DS9405, ADC characteristics) gives the highest source resistance each sampling time can charge to 12-bit accuracy: R_AIN ≤ (k − 0.5) ÷ (f_ADC × C_ADC × ln(2¹⁴)) − R_ADC, with *k* the sampling cycles, f_ADC = 36 MHz, C_ADC ≈ 4 pF and R_ADC ≤ 6 kΩ. For 56 cycles that's about **33 kΩ**, so 1–4.7 kΩ plus the generator's 50 Ω is fine. For 3 cycles the result is negative: even a perfect source wouldn't be fast enough at 36 MHz with 12-bit accuracy, so 56 leaves good margin.
+3. **Change `firmware/main.c`.** The rest of the file stays as in Step 8.
+
+   After the globals, add the sample buffer:
+   ```c
+   #define NSAMP 1000
+   uint16_t samples[NSAMP];                                /* .bss: 2,000 bytes for one burst */
+   ```
+   In the ADC setup, change channel 3's sampling time from 480 to 56 cycles. Replace `ADC1_SMPR2 |= 7u << 9;` with:
+   ```c
+       ADC1_SMPR2 = (ADC1_SMPR2 & ~(7u << 9)) | (3u << 9);  /* channel 3: sample for 56 ADC cycles */
+   ```
+   Replace the body of `if (toggles % 100000u == 0) { ... }` with:
+   ```c
+           if (toggles % 100000u == 0) {                   /* once a second */
+               uint32_t c0 = DWT_CYCCNT;
+               for (uint32_t i = 0; i < NSAMP; i++)
+                   samples[i] = (uint16_t)adc_read(3);     /* back to back: no gaps between conversions */
+               uint32_t burst = DWT_CYCCNT - c0;           /* cycles for the whole burst */
+               uint32_t vref = adc_read(17);
+               uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;
+
+               uint32_t lo = 4095, hi = 0;
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   if (samples[i] < lo) lo = samples[i];
+                   if (samples[i] > hi) hi = samples[i];
+               }
+
+               uart_field("t=",        toggles / 100000u);
+               uart_field(" vdda_mV=", vdda_mV);
+               uart_field(" burst=",   burst);
+               uart_field(" min=",     lo);
+               uart_field(" max=",     hi);
+               uart_puts("\r\n");
+
+               uart_puts("s=");                            /* all 1,000 samples on one line */
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   if (i) uart_putc(',');
+                   uart_putu(samples[i]);
+               }
+               uart_puts("\r\n");
+           }
+   ```
+   With no interrupts running, every pass of the burst loop takes the same time, so the samples are evenly spaced and the spacing is `burst` ÷ 1000.
+
+   Sending the samples takes about 5,000 bytes, about **0.43 s** at 115,200 baud. PF15 stops for that long once a second, then catches up. That's the Step 7 problem at a much larger scale, and fine for now.
+
+   Prediction for `burst`: one conversion is 56 + 12 = 68 ADC cycles = 1.89 µs = 272 CPU cycles. Step 8 measured about 90 cycles of overhead per `adc_read()` at `-O0`, and the loop and the store add roughly a dozen more. That's **about 375 cycles per sample**: a burst of about **375,000 cycles (2.6 ms)**, about 384,000 samples a second. At 2 kHz that's about 5 periods and about 190 samples per period.
+4. **Add `analysis/burst.py`.** It reads one burst from the serial port, converts to millivolts with `vdda_mV`, measures the frequency from the rising crossings of the middle level, fits a sine at that frequency to get the amplitude and offset, and reports what's left over (the residual). With `--plot` it also saves a picture.
+   ```python
+   #!/usr/bin/env python3
+   """Step 9: read one ADC burst from the board and measure the sine in it."""
+   import argparse
+
+   import numpy as np
+   import serial
+
+   CPU_HZ = 144_000_000
+
+   def read_burst(port, nsamp=1000):
+       """Return (header fields, samples) from the second complete burst.
+
+       The first one may be old data held since before the port was opened (Step 7 lesson).
+       """
+       found = 0
+       header = None
+       with serial.Serial(port, 115200, timeout=3) as ser:
+           ser.reset_input_buffer()
+           while True:
+               line = ser.readline().decode(errors="replace").strip()
+               if not line:
+                   raise SystemExit("no data from the board")
+               if line.startswith("t="):
+                   try:
+                       header = dict(kv.split("=") for kv in line.split())
+                   except ValueError:
+                       header = None                       # cut-off line
+               elif line.startswith("s=") and header:
+                   values = line[2:].split(",")
+                   if len(values) == nsamp and all(v.isdigit() for v in values):
+                       found += 1
+                       if found == 2:
+                           return header, np.array([int(v) for v in values])
+                   header = None
+
+   def rising_crossings(mv, dt):
+       """Times where the signal rises through its middle level, with hysteresis against noise."""
+       mid = (mv.max() + mv.min()) / 2
+       hyst = (mv.max() - mv.min()) / 4
+       times, armed = [], False
+       for i in range(1, len(mv)):
+           if mv[i] < mid - hyst:
+               armed = True
+           elif armed and mv[i - 1] < mid <= mv[i]:
+               frac = (mid - mv[i - 1]) / (mv[i] - mv[i - 1])  # between the two samples
+               times.append((i - 1 + frac) * dt)
+               armed = False
+       return times
+
+   def main():
+       ap = argparse.ArgumentParser()
+       ap.add_argument("port", nargs="?", default="/dev/ttyACM0")
+       ap.add_argument("--plot", metavar="PNG", help="save a plot of the burst")
+       args = ap.parse_args()
+
+       header, s = read_burst(args.port)
+       vdda = int(header["vdda_mV"])
+       burst = int(header["burst"])
+       dt = burst / len(s) / CPU_HZ
+       mv = s * vdda / 4095
+       t = np.arange(len(s)) * dt
+
+       print(f"burst: {len(s)} samples in {burst} cycles = {burst / CPU_HZ * 1e3:.3f} ms, "
+             f"{dt * 1e6:.3f} us apart ({1 / dt / 1e3:.1f} kHz), VDDA {vdda} mV")
+       print(f"min {mv.min():.0f} mV, max {mv.max():.0f} mV, mean {mv.mean():.0f} mV")
+
+       fit = None
+       swing = mv.max() - mv.min()
+       times = rising_crossings(mv, dt) if swing > 500 else []  # under 500 mV: no sine, just noise
+       if len(times) >= 2:
+           f = (len(times) - 1) / (times[-1] - times[0])
+           w = 2 * np.pi * f * t
+           a = np.column_stack([np.sin(w), np.cos(w), np.ones_like(t)])
+           coef, *_ = np.linalg.lstsq(a, mv, rcond=None)
+           fit = a @ coef
+           amp = np.hypot(coef[0], coef[1])
+           resid = mv - fit
+           print(f"frequency {f:.1f} Hz ({len(times)} rising crossings)")
+           print(f"sine fit: amplitude {amp:.0f} mV ({2 * amp:.0f} mVpp), offset {coef[2]:.0f} mV")
+           print(f"residual: rms {resid.std():.1f} mV, worst {np.abs(resid).max():.0f} mV")
+       else:
+           print("no sine found (swing under 500 mV or fewer than 2 rising crossings): "
+                 f"spread {mv.std():.1f} mV rms around the mean")
+
+       if args.plot:
+           import matplotlib
+           matplotlib.use("Agg")
+           import matplotlib.pyplot as plt
+           rows = 2 if fit is not None else 1
+           fig, ax = plt.subplots(rows, 1, sharex=True, figsize=(10, 3 * rows), squeeze=False)
+           ax[0][0].plot(t * 1e3, mv, ".", ms=2, label="samples")
+           if fit is not None:
+               ax[0][0].plot(t * 1e3, fit, lw=1, label="sine fit")
+               ax[1][0].plot(t * 1e3, mv - fit, ".", ms=2)
+               ax[1][0].set_ylabel("sample − fit (mV)")
+           ax[0][0].set_ylabel("A0 (mV)")
+           ax[0][0].legend(loc="upper right")
+           ax[-1][0].set_xlabel("time (ms)")
+           fig.tight_layout()
+           fig.savefig(args.plot, dpi=120)
+           print(f"saved {args.plot}")
+
+   if __name__ == "__main__":
+       main()
+   ```
+5. From `firmware/`: `make`, then `make flash`. From the repo root, with nothing else holding the serial port (quit picocom first): `python3 analysis/burst.py --plot docs/step9-sine.png`. Run it a few times. Output looks like:
+   ```
+   burst: 1000 samples in 375210 cycles = 2.606 ms, 2.606 us apart (383.8 kHz), VDDA 3275 mV
+   min 648 mV, max 2652 mV, mean 1655 mV
+   frequency 2000.2 Hz (5 rising crossings)
+   sine fit: amplitude 1000 mV (2000 mVpp), offset 1650 mV
+   residual: rms 3.0 mV, worst 12 mV
+   ```
+6. **Optional, for the Step 8 jumps:** disconnect the generator and tie A0 to GND, run the script again, and look at the plot. One reading a second showed jumps of 15–80 counts about half the time. A 2.6 ms burst shows whether they're single samples, short bursts or a slow wobble. Not part of the Done-when check.
+
+**Done when:**
+- Substep 1: the scope shows the generator at about 0.65–2.65 V, 2 kHz, *before* it was connected to A0.
+- `burst` is about **375,000 cycles** (within about 10%) and nearly the same on every line.
+- The script's **frequency** is within 1% of 2 kHz.
+- The fitted **peak-to-peak** (2 × amplitude) is within about 3% of the Vpp the scope measured, and the **offset** within about 50 mV of the scope's mean.
+- The plot shows a clean sine, and the residual rms is a few mV. Spikes like the Step 8 jumps would show up here as single points far from the fit: write down how many there are and how big.
+
+Write down the scope's Vpp, mean and frequency; `burst`; and the script's frequency, amplitude, offset and residual. Save the plot.
