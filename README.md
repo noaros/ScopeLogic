@@ -1590,3 +1590,141 @@ LA1010, CH0 on PF14 at 100 MSa/s: high **2.22 µs**, period **1.00004 ms**, **99
 - **Measure the delay with the clock that made the tick.** `TIM1_CNT` counts the same 144 MHz cycles as the sample period, so `counter − CCR1` is the lateness in cycles, with no extra wiring.
 - **Read a variable an interrupt changes once, and use that copy.** Reading it twice lost one tick per line here.
 - **A logic analyzer pin shows how long a handler really runs.** The PF14 pulse showed 2.22 µs, which accounts for most of the gap to the 2.54 µs worst lateness.
+
+
+## Step 12 — Interrupt mode: the timer and the ADC call the CPU
+
+**Goal:** stop the CPU from waiting. In Steps 10 and 11 the CPU spun on CC1IF, then spun on EOC: it couldn't do anything else during a burst. Now two interrupts do the work:
+
+- **`TIM1_CC_IRQHandler`** runs on every TIM1 tick and starts one conversion (SWSTART).
+- **`ADC_IRQHandler`** runs when that conversion finishes and stores the result.
+
+Between them `main()` is free. For now it just waits for the burst to finish; a later step measures how much free time that is (CPU load).
+
+The interrupts need two things from the Cortex-M4's interrupt controller, the **NVIC** (nested vectored interrupt controller):
+- **Enabling.** A peripheral raising its interrupt line isn't enough: the NVIC passes it on only if that interrupt's bit is set in `NVIC_ISER0`. The ADC is interrupt number 18 and TIM1's capture/compare is 27 (RM0090 Table 62). The vector table in `startup.c` also has to grow from the 16 core entries to all 91 STM32F429 interrupts, so those two numbers have an address to jump to.
+- **Priority.** Each interrupt has a priority, 0 being the highest. A higher-priority interrupt can **preempt** (interrupt) a lower one. One that comes while an equal or higher one is running waits until it returns, and then starts without unstacking and restacking the registers (**tail-chaining**, 6 cycles instead of about 12 + 10).
+
+The priorities decide who wins when the SysTick load and a sample tick collide, so this step measures lateness with three settings:
+1. **`LOAD 0`:** no background load. The lateness is now the CPU's **interrupt latency**: about 12 cycles to save registers and fetch the handler's address, plus the handler's first instructions.
+2. **`LOAD 1`, SysTick first** (`SYSTICK_PRIO 0`, `ACQ_PRIO 1`): a tick that arrives while SysTick is running waits for it to finish, much like polling in Step 11.
+3. **`LOAD 1`, acquisition first** (`ACQ_PRIO 0`, `SYSTICK_PRIO 1`): the tick interrupt **preempts** SysTick. The background work gets delayed by a few µs instead, which it can tolerate. Polling can't do this: a polling loop can never interrupt an interrupt.
+
+1. **Wiring.** No change from Step 11: generator on A0, scope as before, LA CH0 on D4 (PF14). The LA isn't needed this time.
+2. **Change `firmware/startup.c`.** Add two weak handlers after `SysTick_Handler`:
+   ```c
+   void ADC_IRQHandler(void)     __attribute__((weak, alias("Default_Handler")));
+   void TIM1_CC_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
+   ```
+   Make the vector table hold all 91 peripheral interrupts. Change its comment and first line to:
+   ```c
+   /* The 16 Cortex-M4 entries, then the STM32F429's 91 peripheral interrupts (RM0090 Table 62) */
+   __attribute__((section(".isr_vector"), used))
+   void (*const vectors[16 + 91])(void) = {
+   ```
+   and after the `SysTick_Handler, /* 15 */` entry add:
+   ```c
+       [16 ... 16 + 90] = Default_Handler,     /* every peripheral interrupt, unless named below */
+       [16 + 18] = ADC_IRQHandler,
+       [16 + 27] = TIM1_CC_IRQHandler,
+   ```
+   `[16 ... 16 + 90]` is a GCC range: it fills entries 16–106 with `Default_Handler`, and the next two lines then replace entries 34 and 43. Peripheral interrupt *n* is entry 16 + *n*: the first 16 belong to the core. An entry left at 0 would make the CPU jump to address 0 and fault, so every unused interrupt points at `Default_Handler`, where a debugger shows it as stuck.
+3. **Change `firmware/main.c`.**
+
+   Add the registers, after the SysTick ones:
+   ```c
+   #define ADC1_CR1    (*(volatile uint32_t *)0x40012004)
+   #define TIM1_DIER   (*(volatile uint32_t *)0x4001000C)
+   #define NVIC_ISER0  (*(volatile uint32_t *)0xE000E100)
+   #define NVIC_IPR(n) (*(volatile uint8_t  *)(0xE000E400 + (n)))   /* priority of interrupt n, one byte each */
+   #define SHPR3_SYSTICK (*(volatile uint8_t *)0xE000ED23)          /* SysTick's priority byte */
+   #define ADC_IRQ     18                                  /* interrupt numbers, RM0090 Table 62 */
+   #define TIM1_CC_IRQ 27
+   ```
+   After `#define LATE_LIMIT`, add:
+   ```c
+   #define ACQ_PRIO       1u                               /* priority of the TIM1 and ADC interrupts: 0 is the highest */
+   #define SYSTICK_PRIO   0u                               /* priority of the background load */
+   ```
+   After `SysTick_Handler`, add the burst state and the two handlers:
+   ```c
+   /* Burst state, shared between the interrupts and main(): all volatile */
+   volatile uint32_t n_started, n_done, missed, first, last;
+   volatile uint32_t late_min, late_max, n_late;
+
+   /* Every TIM1 tick: start one conversion */
+   void TIM1_CC_IRQHandler(void)
+   {
+       uint32_t cnt = TIM1_CNT;                            /* where the timer is now */
+       TIM1_SR = ~(1u << 1);                               /* clear CC1IF, or the interrupt comes straight back */
+       if (n_started != n_done) {                          /* the last conversion hasn't been collected yet */
+           missed++;
+           return;
+       }
+       ADC1_CR2 |= 1u << 30;                               /* SWSTART */
+       last = DWT_CYCCNT;
+       if (n_started == 0) first = last;
+       n_started++;
+       if (n_started == NSAMP) TIM1_DIER &= ~(1u << 1);    /* that was the last one: stop the tick interrupts */
+
+       uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
+       if (late < late_min) late_min = late;
+       if (late > late_max) late_max = late;
+       if (late > LATE_LIMIT) n_late++;
+   }
+
+   /* Every finished conversion: collect the result */
+   void ADC_IRQHandler(void)
+   {
+       samples[n_done] = (uint16_t)ADC1_DR;                /* reading DR clears EOC, which ends the interrupt */
+       n_done++;
+       if (n_done == NSAMP) ADC1_CR1 &= ~(1u << 5);        /* last one: EOCIE off, so adc_read() can poll again */
+   }
+   ```
+   The handlers' names must match `startup.c` exactly. A typo isn't an error: the weak default stays in the table and the first tick ends in `Default_Handler`.
+
+   After the `#if LOAD ... #endif` SysTick block, set the priorities and enable both interrupts in the NVIC:
+   ```c
+       SHPR3_SYSTICK = SYSTICK_PRIO << 4;                  /* STM32 uses the top 4 bits of each priority byte */
+       NVIC_IPR(TIM1_CC_IRQ) = ACQ_PRIO << 4;
+       NVIC_IPR(ADC_IRQ)     = ACQ_PRIO << 4;
+       NVIC_ISER0 = (1u << TIM1_CC_IRQ) | (1u << ADC_IRQ); /* let both through the NVIC */
+   ```
+   In the once-a-second block, replace everything from `uint32_t missed = 0, first = 0, last = 0;` up to (not including) `uint32_t span = last - first;` with:
+   ```c
+               n_started = 0; n_done = 0; missed = 0;
+               late_min = PERIOD; late_max = 0; n_late = 0;
+               ADC1_SQR3 = 3;                              /* A0 for the whole burst */
+               ADC1_CR1 |= 1u << 5;                        /* EOCIE: interrupt at the end of each conversion */
+               TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+               TIM1_DIER |= 1u << 1;                       /* CC1IE: interrupt on every tick from now on */
+               while (n_done < NSAMP) {}                   /* the CPU is free here; for now it just waits */
+   ```
+   The rest of the block stays: it reads `span`, `missed`, `late_min` and so on, now the globals the handlers filled in.
+
+   Notes:
+   - **Why `volatile`.** `main()` waits on `n_done`, but only `ADC_IRQHandler` changes it. Without `volatile` the compiler may read it once and loop forever.
+   - **Why clear CC1IF first thing.** The flag is what holds the interrupt request up. If the handler returned without clearing it, the interrupt would fire again at once. Writes to a peripheral take a few cycles to land, so clearing it early also avoids a second, false entry just after the handler returns.
+   - **`missed` now means** a tick arrived before the previous result was collected. The handler skips that tick rather than starting a conversion on top of one that hasn't been read.
+   - **EOCIE goes off at the end of the burst** because `adc_read(17)` (VREFINT) still polls EOC. With EOCIE on, `ADC_IRQHandler` would read DR first and store VREFINT as sample 1001, past the end of the array.
+   - Lateness is still measured by reading `TIM1_CNT` as the handler's first action, so it compares directly with Step 11.
+
+   Predictions:
+   - **`LOAD 0`:** `late_min` about **20–35 cycles**: about 12 for the CPU to enter the interrupt, plus the handler's first instructions and the read from TIM1 over the bus. The spread (`late_max` − `late_min`) should be only **a few cycles**, smaller than polling's 10–14: the CPU doesn't need to finish a pass of a wait loop, only the current instruction. `n_late=0`, `missed=0`, `span` within a few cycles of 1,438,560.
+   - **`LOAD 1`, SysTick first:** like Step 11. Most lines look like `LOAD 0`. About 1 line in 4 has late samples, up to about **340–370 cycles (2.4–2.6 µs)**: the rest of SysTick's run, plus tail-chaining into the TIM1 handler.
+   - **`LOAD 1`, acquisition first:** `n_late=0` on every line, and `late_max` close to the `LOAD 0` value. Preempting SysTick costs the same 12 cycles as interrupting `main()`. `systicks` stays 1000: SysTick is delayed a few µs at times, but never skipped.
+   - **`missed=0`** in all three.
+4. Run each of the three settings from `firmware/`, editing the defines, then `make` and `make flash`. Watch about 30 s of lines each time:
+   `stty -F /dev/ttyACM0 115200 raw -echo; grep -a --line-buffered '^t=' /dev/ttyACM0`
+   1. `LOAD 0`.
+   2. `LOAD 1`, `ACQ_PRIO 1u`, `SYSTICK_PRIO 0u`.
+   3. `LOAD 1`, `ACQ_PRIO 0u`, `SYSTICK_PRIO 1u`.
+5. With the third setting still flashed, from the repo root: `python3 analysis/burst.py --plot docs/step12-sine.png`, to check that the interrupts store the samples in the right order.
+
+**Done when:**
+- `LOAD 0`: `n_late=0` and `missed=0` on every line, with `late_max` − `late_min` no more than polling's 10–14 cycles.
+- `LOAD 1`, SysTick first: some lines have late samples, up to about 2.5 µs; `missed=0`.
+- `LOAD 1`, acquisition first: `n_late=0` on every line, `late_max` within a few cycles of `LOAD 0`, `systicks` 1000 (sometimes 999), `missed=0`.
+- `burst.py`: frequency within 0.1% of 2 kHz, peak-to-peak and offset as in Step 10, 20 clean cycles in the plot.
+
+Write down `late_min` and `late_max` for each setting, and for SysTick first how many lines out of 30 had late samples and the largest `late_max`. Also write down the script's frequency, amplitude, offset and residual.
