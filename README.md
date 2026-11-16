@@ -977,3 +977,41 @@ From those it works out the real supply voltage, `vdda_mV = 3300 × cal ÷ vref`
 - `conv` is about 1,970 cycles, steady from line to line.
 
 Write down `cal`, a typical `vref` and `vdda_mV`, the GND and 3V3 readings, and `conv`.
+
+**Measured** (one line per second, about 12–20 s for each check):
+
+- `cal` = **1491**. `vref` = **1500–1504**, 0.6–0.9% above `cal`, inside ±1%. `vdda_mV` = **3271–3280**, so the supply is about 0.7% below 3.3 V. That's why `vref` reads high.
+- `conv` = **2057–2058** cycles on every line. That's about 90 cycles more than the 1,970 predicted, where I'd said "a few dozen". The extra comes from code compiled without optimisation, register accesses over the APB2 bus, and syncing between the 36 MHz ADC clock and the 144 MHz CPU clock.
+- **A0 to GND:** the reading was either exactly **0** or a jump, never anything in between. With the jumper on the first GND pin, 9 of 15 readings were 0 and the rest were 16–25 (12–19 mV). On a second GND pin, 11 of 20 were 0 and the rest were 68–80 (54–63 mV). Pushing the jumper in further changed nothing. That misses the "under about 10" check.
+- **A0 to 3V3:** the same pattern, the other way up. 7 of 12 readings were **4095**, with `a0_mV` equal to `vdda_mV`, and 5 dipped to **4040–4053**, 33–44 mV low. That misses the "over about 4085" check.
+- **A0 floating:** **965–990** (771–791 mV), much the same as in earlier sessions. It moved about 25 counts but didn't wander as much as expected.
+
+The jumps on A0 aren't the ADC's own error, which is only a few counts. Their size depends on which GND pin A0 is tied to, while `vref`, which is measured inside the chip, stays steady throughout. Most likely the grounds and supply at the header pins aren't all at quite the same voltage as the ADC's, and the difference moves around with current from the USB, the ST-LINK and the switching pins. Catching it needs many readings close together, which comes with the timer- and DMA-driven sampling in later steps.
+
+The floating value probably stays near 0.78 V because a floating pin holds its charge. Each conversion connects the ADC's small sampling capacitor to the pin, and on its own the pin leaks only slowly. This is my best guess, not something I measured.
+
+### Step 8 summary
+
+**Step 8 got ADC1 reading with single conversions started by software. The internal reference and the timing came out as predicted. The external pin works, but at both GND and 3V3 about half the readings are off by 15–80 counts.**
+
+**What changed in the firmware:**
+1. **ADC1 setup:** GPIOA and ADC1 clocks on, PA3 to analog mode, ADC clock = APB2 ÷ 2 = 36 MHz, VREFINT on, 480-cycle sampling for channels 3 and 17, ADC on, then a 20 µs wait.
+2. **`adc_read()`:** picks the channel, starts a conversion, waits for `EOC`, returns `DR`.
+3. **Once a second:** read A0 (timed with the cycle counter) and VREFINT, work out `vdda_mV` and `a0_mV`, and send them all. The Step 7 `tx` field is gone.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| `vref` against `cal` = 1491 | within ±1% (1476–1506) | 1500–1504 (+0.6 to +0.9%) |
+| `vdda_mV` | 3250–3350 | 3271–3280 |
+| `conv` | about 1,970 cycles, steady | 2057–2058, steady |
+| A0 to GND | under about 10 | 0, with jumps to 16–25 (first GND pin) or 68–80 (second GND pin) about half the time |
+| A0 to 3V3 | over about 4085, `a0_mV` ≈ `vdda_mV` | 4095 (`a0_mV` = `vdda_mV`), with dips to 4040–4053 about half the time |
+| A0 floating | wanders | 965–990 (about 0.78 V) |
+
+**What you learned along the way:**
+- **The ADC measures relative to its own supply.** A reading only becomes volts once you know VDDA, and VREFINT plus the factory `VREFINT_CAL` tell you VDDA (3.275 V here, not 3.300 V).
+- **A conversion is mostly sampling.** 480 of the 492 ADC cycles are spent charging the sampling capacitor, and VREFINT needs at least 10 µs of it. At 36 MHz that's 13.67 µs, or about 2,000 CPU cycles of waiting while polling.
+- **Ground isn't one voltage.** Tying A0 to a different GND pin changed the error by four times. The internal reference never goes through a header pin, so it stayed steady.
+- **One reading a second only shows that something is wrong.** It can't show what the jumps look like or when they happen. Faster sampling, coming later, can.

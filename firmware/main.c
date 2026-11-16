@@ -5,7 +5,9 @@
 #define RCC_CFGR    (*(volatile uint32_t *)0x40023808)
 #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
 #define RCC_APB1ENR (*(volatile uint32_t *)0x40023840)
+#define RCC_APB2ENR (*(volatile uint32_t *)0x40023844)
 #define FLASH_ACR   (*(volatile uint32_t *)0x40023C00)
+#define GPIOA_MODER (*(volatile uint32_t *)0x40020000)
 #define GPIOB_MODER (*(volatile uint32_t *)0x40020400)
 #define GPIOB_BSRR  (*(volatile uint32_t *)0x40020418)
 #define GPIOC_MODER   (*(volatile uint32_t *)0x40020800)
@@ -23,6 +25,14 @@
 #define USART3_DR   (*(volatile uint32_t *)0x40004804)
 #define USART3_BRR  (*(volatile uint32_t *)0x40004808)
 #define USART3_CR1  (*(volatile uint32_t *)0x4000480C)
+#define ADC1_SR     (*(volatile uint32_t *)0x40012000)
+#define ADC1_CR2    (*(volatile uint32_t *)0x40012008)
+#define ADC1_SMPR1  (*(volatile uint32_t *)0x4001200C)
+#define ADC1_SMPR2  (*(volatile uint32_t *)0x40012010)
+#define ADC1_SQR3   (*(volatile uint32_t *)0x40012034)
+#define ADC1_DR     (*(volatile uint32_t *)0x4001204C)
+#define ADC_CCR     (*(volatile uint32_t *)0x40012304)
+#define VREFINT_CAL (*(volatile uint16_t *)0x1FFF7A2A)  /* factory reading of VREFINT at 3.3 V, 30 C */
 
 /* Globals: the startup code sets these up before main() runs */
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
@@ -49,9 +59,24 @@ static void uart_putu(uint32_t v)
     while (n) uart_putc(digits[--n]);                   /* most significant digit first */
 }
 
+static void uart_field(const char *name, uint32_t v)   /* sends e.g. " a0=1234" */
+{
+    uart_puts(name);
+    uart_putu(v);
+}
+
+/* One conversion, started by software, waited for by polling */
+static uint32_t adc_read(uint32_t channel)
+{
+    ADC1_SQR3 = channel;                                /* the one channel to convert */
+    ADC1_CR2 |= 1u << 30;                               /* SWSTART: start a conversion */
+    while (!(ADC1_SR & (1u << 1))) {}                   /* wait for EOC: end of conversion */
+    return ADC1_DR;                                     /* 12-bit result, 0..4095; reading it clears EOC */
+}
+
 int main(void)
 {
-    RCC_AHB1ENR |= (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5);  /* GPIOB, GPIOC, GPIOD, GPIOF clocks */
+    RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5);  /* GPIOA, B, C, D, F clocks */
     (void)RCC_AHB1ENR;
 
     /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
@@ -99,7 +124,17 @@ int main(void)
     DWT_CYCCNT = 0;
     DWT_CTRL  |= 1u << 0;                               /* CYCCNTENA: start counting */
 
-    uint32_t tx = 0;                                    /* cycles the last line took to send */
+    /* ADC1: PA3 (A0, channel 3) and the internal reference VREFINT (channel 17) */
+    RCC_APB2ENR |= 1u << 8;                             /* ADC1 clock */
+    (void)RCC_APB2ENR;
+    GPIOA_MODER |= 3u << 6;                             /* PA3 = analog */
+    ADC_CCR = (ADC_CCR & ~(3u << 16)) | (1u << 23);     /* ADCPRE = /2: 72 MHz APB2 -> 36 MHz ADC clock; TSVREFE: VREFINT on */
+    ADC1_SMPR2 |= 7u << 9;                              /* channel 3: sample for 480 ADC cycles */
+    ADC1_SMPR1 |= 7u << 21;                             /* channel 17: 480 cycles (VREFINT needs at least 10 us) */
+    ADC1_CR2   |= 1u << 0;                              /* ADON: power up the ADC */
+    uint32_t t0 = DWT_CYCCNT;
+    while (DWT_CYCCNT - t0 < 20u * 144u) {}             /* wait 20 us for the ADC and VREFINT to settle */
+
     uint32_t next = DWT_CYCCNT;
     for (;;) {
         next += period;                                 /* next deadline, from the last one, not from now */
@@ -108,12 +143,22 @@ int main(void)
         toggles++;
 
         if (toggles % 100000u == 0) {                   /* 100,000 flips = once a second */
-            uint32_t start = DWT_CYCCNT;
-            uart_puts("t=");        uart_putu(toggles / 100000u);
-            uart_puts(" toggles="); uart_putu(toggles);
-            uart_puts(" tx=");      uart_putu(tx);
+            uint32_t c0   = DWT_CYCCNT;
+            uint32_t a0   = adc_read(3);
+            uint32_t conv = DWT_CYCCNT - c0;            /* cycles one conversion took */
+            uint32_t vref = adc_read(17);
+            uint32_t cal  = VREFINT_CAL;
+            uint32_t vdda_mV = vref ? 3300u * cal / vref : 0;  /* real supply: VREFINT read low = supply high */
+            uint32_t a0_mV   = a0 * vdda_mV / 4095u;
+
+            uart_field("t=",        toggles / 100000u);
+            uart_field(" a0=",      a0);
+            uart_field(" a0_mV=",   a0_mV);
+            uart_field(" vref=",    vref);
+            uart_field(" cal=",     cal);
+            uart_field(" vdda_mV=", vdda_mV);
+            uart_field(" conv=",    conv);
             uart_puts("\r\n");
-            tx = DWT_CYCCNT - start;                    /* cycles this line took, sent with the next one */
         }
     }
 }
