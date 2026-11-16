@@ -1424,3 +1424,117 @@ Board, generator on A0 as in Step 9. Three runs of `analysis/burst.py`:
 - **Check the scope's automatic measurements with the cursors.** On a fast square wave seen through a clip line, All Measure was 4% off, while cursors across 10 periods agreed with the board to 0.2%. Measuring across many periods makes any error in where you place the cursors that many times smaller.
 - **Time cursors and voltage cursors are different lines.** AX/BX are vertical lines that measure time, and AY/BY are horizontal lines that measure voltage.
 - **A hardware timer sets when each sample is taken, not how fast the code runs.** The only timing error left is the wait loop's granularity, about 12 cycles (83 ns), and `missed` shows when the code can't keep up.
+
+
+## Step 11 — Add a background interrupt load and measure how late each sample is
+
+**Goal:** make the CPU busy with something else, the way a real application is, and measure what that does to the sample timing. A **SysTick interrupt** fires about 1,000 times a second and wastes **2 µs** each time. It stands in for "the rest of the program": a control loop, a display, a protocol stack.
+
+In Step 10 nothing could interrupt the burst, so every sample started within about 12 cycles of its tick. Now, if SysTick fires just before a tick, the CPU is still inside the interrupt when the tick arrives, so the conversion starts late. To see that, each sample now records **how late it is**. The firmware reads TIM1's counter right after noticing CC1IF. The flag was set when the counter reached CCR1 (720), so `counter − 720` is the number of cycles since the tick, measured by the same hardware clock that made it.
+
+This is the **jitter** of polled sampling: the spread of those delays. The polling, interrupt and DMA steps all measure it with this load running, so the comparison reflects a busy CPU, not an idle one.
+
+Two details:
+- **The interrupt only delays a sample if it's running when the tick arrives** and the CPU is waiting in the loop. If it fires while `adc_read()` is waiting for the conversion, the conversion is already running in hardware: the result is collected later, but it was sampled on time. One `adc_read()` takes about 364 cycles and the interrupt about 330, so even then the CPU is back well before the next tick.
+- **The period is 144,007 cycles, not 144,000.** 144,000 is exactly 100 sample periods, so the interrupt would land at the same point in the sample period every time. Depending on where it landed at power-up, it would then hit every burst or none of them. 144,007 shifts the interrupt by 7 cycles each time, so over many bursts it lands everywhere. Real background work isn't locked to the sample clock either.
+
+1. **Wiring.** Keep everything from Step 10. Add the **LA1010**: **CH0** on a jumper in **D4** (PF14, **CN10 pin 8**: fourth row from the top, right-hand column) and the LA ground on a jumper in **GND** (**CN10 pin 17**: ninth row, left-hand column). PF14 is high while the interrupt runs.
+2. **Change `firmware/main.c`.**
+
+   Add the registers, after the TIM1 ones:
+   ```c
+   #define TIM1_CNT    (*(volatile uint32_t *)0x40010024)
+   #define SYST_CSR    (*(volatile uint32_t *)0xE000E010)
+   #define SYST_RVR    (*(volatile uint32_t *)0xE000E014)
+   #define SYST_CVR    (*(volatile uint32_t *)0xE000E018)
+   ```
+   Below `#define FS`, add:
+   ```c
+   #define PERIOD (144000000u / FS)                        /* CPU cycles per sample: 1440 */
+
+   #define LOAD 1                                          /* 1: background SysTick load on, 0: off */
+   #define SYSTICK_CYCLES 144007u                          /* about 1 kHz; deliberately not a multiple of PERIOD */
+   #define LOAD_CYCLES    288u                             /* 2 us of busy work per interrupt */
+   #define LATE_LIMIT     100u                             /* a sample more than this many cycles late counts as late */
+   ```
+   After `uint16_t samples[NSAMP];`, add the counter and the interrupt handler:
+   ```c
+   volatile uint32_t systicks;                             /* .bss: counted by SysTick_Handler */
+
+   /* The background load. This replaces the weak SysTick_Handler in startup.c */
+   void SysTick_Handler(void)
+   {
+       GPIOF_BSRR = 1u << 14;                              /* PF14 (D4) high: handler running */
+       uint32_t t0 = DWT_CYCCNT;
+       while (DWT_CYCCNT - t0 < LOAD_CYCLES) {}            /* stand-in for real work */
+       systicks++;
+       GPIOF_BSRR = 1u << (14 + 16);                       /* PF14 low */
+   }
+   ```
+   `volatile` matters here: `main()` reads `systicks`, but only the interrupt changes it. Without `volatile` the compiler may keep a copy in a register and never see it change.
+
+   Make PF14 an output. After the PF15 `GPIOF_MODER` line, add:
+   ```c
+       GPIOF_MODER = (GPIOF_MODER & ~(3u << 28)) | (1u << 28);   /* PF14 (D4) = output: SysTick marker */
+   ```
+   After `TIM1_CR1 = 1u << 0;`, start SysTick:
+   ```c
+   #if LOAD
+       SYST_RVR = SYSTICK_CYCLES - 1;                      /* counts down from RVR to 0, then interrupts */
+       SYST_CVR = 0;                                       /* start from the top */
+       SYST_CSR = 7u;                                      /* CLKSOURCE = CPU clock, TICKINT = interrupt, ENABLE */
+   #endif
+   ```
+   Change `uint32_t next = DWT_CYCCNT;` before the main loop to:
+   ```c
+       uint32_t next = DWT_CYCCNT, prev_systicks = 0;
+   ```
+   In the once-a-second block, replace from `uint32_t missed = 0, first = 0, last = 0;` to the end of the burst's `for` loop with:
+   ```c
+               uint32_t missed = 0, first = 0, last = 0;
+               uint32_t late_min = PERIOD, late_max = 0, n_late = 0;
+               TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
+                   TIM1_SR = ~(1u << 1);                   /* clear it */
+                   uint32_t cnt = TIM1_CNT;                /* where the timer is now */
+                   last = DWT_CYCCNT;
+                   if (i == 0) first = last;
+                   samples[i] = (uint16_t)adc_read(3);
+                   uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
+                   if (late < late_min) late_min = late;
+                   if (late > late_max) late_max = late;
+                   if (late > LATE_LIMIT) n_late++;
+                   if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
+               }
+   ```
+   The lateness is worked out *after* `adc_read()`, so the division doesn't delay the conversion. Add four fields to the line, after `missed=`:
+   ```c
+               uart_field(" systicks=", systicks - prev_systicks);
+               prev_systicks = systicks;
+               uart_field(" late_min=", late_min);
+               uart_field(" late_max=", late_max);
+               uart_field(" n_late=",   n_late);
+   ```
+   Register notes: SysTick is part of the Cortex-M4 core, not an ST peripheral, so it's in ARM's documentation (PM0214) rather than RM0090. It counts down from `RVR` to 0 and then interrupts, so the period is `RVR + 1` cycles. Its priority is 0 after reset, the highest, so nothing in this program can delay it. The handler needs no setup beyond its name: the vector table in `startup.c` already points entry 15 at `SysTick_Handler`, and the `weak` default gets replaced (Step 6).
+
+   Predictions, per line:
+   - **`systicks` = 1000**, sometimes 999: 144,000,000 / 144,007 = 999.95 per second.
+   - **`late_min`** is a few tens of cycles: the wait loop, clearing the flag and reading the counter. It barely changes from line to line, because nothing in that path varies.
+   - **Most lines (roughly 3 in 4):** `late_max` within about 12 of `late_min`, and `n_late=0`. Interrupts that come in the 10 ms burst then all land while `adc_read()` is waiting, which doesn't delay a sample.
+   - **The other lines:** `n_late` up to about **10** (one per interrupt in the 10 ms burst; they all land at about the same point in the sample period), and `late_max` up to about **330 cycles** more than `late_min`, which is **about 2.3 µs**: 288 cycles of busy work plus about 12 cycles to enter the interrupt, about 12 to leave it, and the handler's own code.
+   - **`missed=0`** still: even a late sample finishes long before the next tick. `span` matches Step 10, except on lines where the first or last sample was late.
+   - **PF14 on the LA:** a pulse a little over **2.0 µs** wide every **1.000 ms**.
+3. From `firmware/`: first set `#define LOAD 0`, then `make` and `make flash`. Watch the lines for about 20 s, without the sample lines:
+   `stty -F /dev/ttyACM0 115200 raw -echo; grep -a --line-buffered '^t=' /dev/ttyACM0`
+   This is the baseline: `systicks=0`, PF14 stays low.
+4. Set `#define LOAD 1`, `make`, `make flash`, and watch for about 30 s again.
+5. In KingstVIS, capture CH0 at **100 MSa/s** for at least **5 ms**. Measure one PF14 pulse width and the time between two rising edges.
+
+**Done when:**
+- With `LOAD 0`: `systicks=0`, `n_late=0` and `late_max` − `late_min` ≤ about 12 on every line.
+- With `LOAD 1`: `systicks` is 999 or 1000 on every line, and `missed=0`.
+- With `LOAD 1`, some lines show `n_late` > 0 and `late_max` about 100–330 cycles above `late_min`, while the other lines look like the baseline.
+- The LA shows PF14 pulses about 2.0 µs wide, 1.000 ms apart.
+
+Write down `late_min` and `late_max` for both runs, and for `LOAD 1` how many lines out of 30 had late samples, the largest `n_late` and the largest `late_max`. Also write down the LA pulse width and period. In µs (cycles ÷ 144), `late_max` − `late_min` is the jitter of polled sampling with this load.
