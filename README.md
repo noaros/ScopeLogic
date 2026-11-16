@@ -2663,3 +2663,47 @@ I don't have a prediction this time: either outcome narrows it down. The scope m
 - You can say which row of the table the results match.
 
 Write down the five 300–600 Hz values and the top peaks for each run, the DC run's spread, and what the scope showed.
+
+**Measured** (`MODE=3 LOAD=0`, 100 kHz, five bursts per run unless noted, in this order):
+
+| Run | Input | Spread or residual rms | 300–600 Hz rms | Top peaks |
+|---|---|---|---|---|
+| 1 | 2 kHz sine | – | 4.8–5.2 mV | 400, 500 Hz in all 5 |
+| 2 | DC 1.65 V | spread 8.5–10.1 mV | 4.8–5.5 mV | 400, 500 Hz in all 5 |
+| – | DC, during and after the scope check (6 bursts) | spread 3.0–4.2 mV | **0.9–1.2 mV** | 400, 500 Hz still on top in most, but small |
+| 3 | 2 kHz sine | residual 8.0–9.6 mV | 4.8–5.3 mV | 400, 500 Hz in all 5 |
+| extra | DC again, read at once and 1 minute later (6 bursts) | spread 8.3–9.5 mV | 4.7–5.4 mV | – |
+| extra | DC, scope stopped (4 bursts) | spread 8.4–8.8 mV | 5.0–5.2 mV | 400, 500 Hz in all 4 |
+
+Sine runs: 1999.9–2000.4 Hz, 1982–1987 mVpp, offset 1647–1652 mV. DC runs: mean 1648–1651 mV.
+
+- **The wave doesn't need the sine.** With a steady 1.65 V input it's the same size, 4.7–5.5 mV, as with the sine. It's added on the way in, not carried by the generator's waveform. That's the first row of the table above.
+- **Scope check of the generator's output** (CH1 at 1X, AC coupling, most sensitive V/div, 1 ms/div, generator on DC): a sine-like ripple repeating every **5–6 divisions (5–6 ms, about 170–200 Hz)**, Pk-Pk **16.8 mV**. That's not the 400–500 Hz in the ADC data. The ADC's 200 Hz bin read about 0.1 mV, but that was taken during the quiet period below. The scope may also see its own noise or pickup at that sensitivity.
+
+**A quiet period that wasn't explained.** During and after the scope check, the wave dropped to about a fifth of its size (0.9–1.2 mV), and the spread fell from about 9 mV to 3–4 mV. It stayed down after CH1 went back to 10X, DC and 500 mV/div, and after CH2, which had been turned off, went back on. It came back when the generator was switched to the sine, and stayed when it was switched to DC again. Ruled out as the switch, each tested by changing that one thing: CH1's probe and coupling settings, CH2 on or off, the scope running or stopped, DC versus sine. The laptop was on its charger throughout. What's left is something physical (a cable, clip or jumper moved while handling the probe) or something in the surroundings. It's worth noting how big the change was: in the quiet state the total spread was **3–4 mV rms**, less than half of the usual 8–10 mV. So about half the ADC noise in every step so far comes from the same source as the wave.
+
+![ADC with a 1.65 V DC input: the 400–500 Hz wave is still there](docs/step17-dc.png)
+
+### Step 17 summary
+
+**Step 17 replaced the generator's sine with a steady 1.65 V. The 400–500 Hz wave stayed the same size, so it's added on the way in, not carried by the sine. For a few minutes, for a reason that wasn't found, the wave and most of the other noise disappeared: spread 3–4 mV instead of 8–10.**
+
+**What changed:**
+1. **`burst.py`** gives an input without a sine the same residual spectrum and band rms, measured around the mean.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| Runs 1 and 3 (sine) agree, and match Step 16 run B | 4.6–5.0 mV | 4.8–5.2 and 4.8–5.3 mV |
+| Run 2 (DC) | either about 5 mV or 1–2 mV | 4.8–5.5 mV, and 4.7–5.4 mV on repeating |
+| Which row of the table | – | the first: the wave doesn't need the sine |
+| Scope on the generator's output | a ripple, or nothing | about 170–200 Hz, 16.8 mV Pk-Pk: not the ADC's 400–500 Hz |
+
+**Open, with what's known so far:** not the CPU (Step 16), not the mode, not the sine, not the scope's settings or acquisition, not the SysTick load, not the LA. Something on the input or ground side, which once went away by itself for several minutes. When it did, the ADC's total noise halved.
+
+**What you learned along the way:**
+- **Answer the question you asked first.** DC versus sine settled the step's question, even though a bigger puzzle turned up along the way.
+- **When a result changes unexpectedly, write down what you touched.** The quiet period couldn't be traced, because what changed during the scope check wasn't known one action at a time.
+- **Repeat a run before trusting the odd one.** DC was run twice more, and that showed the quiet period, not the first DC run, was the odd one out.
+- **Total noise can hide a single source.** The quiet state showed that about half of the usual 8–10 mV spread comes and goes with the wave.
