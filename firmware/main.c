@@ -63,10 +63,17 @@
 #define DMA2_S0PAR  (*(volatile uint32_t *)0x40026418)
 #define DMA2_S0M0AR (*(volatile uint32_t *)0x4002641C)
 
+#ifndef FS                                              /* make FS=500000 overrides this */
 #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
+#endif
+#if 144000000u % FS != 0
+#error "FS must divide 144 MHz exactly, e.g. 100000, 200000, 600000, 2400000"
+#endif
 #define PERIOD (144000000u / FS)                        /* CPU cycles per sample: 1440 */
 
+#ifndef MODE                                            /* make MODE=1 overrides this */
 #define MODE 3                                          /* 1 = polling, 2 = interrupts, 3 = DMA */
+#endif
 #define WINDOW ((NSAMP + 2u) * PERIOD)                  /* idle-count window: the whole burst plus 2 periods */
 
 #define LOAD 1                                          /* 1: background SysTick load on, 0: off */
@@ -96,7 +103,7 @@ void SysTick_Handler(void)
 
 /* Burst state, shared between the interrupts and main(): all volatile */
 volatile uint32_t n_started, n_done, missed, first, last;
-volatile uint32_t late_min, late_max, n_late;
+volatile uint32_t late_min, late_max, n_late, late_first, late_last;
 
 /* Count loop passes for a fixed number of cycles. Any cycle an interrupt or the DMA
    takes away is a cycle this loop doesn't run, so fewer passes = more CPU used elsewhere */
@@ -126,6 +133,8 @@ void TIM1_CC_IRQHandler(void)
     if (late < late_min) late_min = late;
     if (late > late_max) late_max = late;
     if (late > LATE_LIMIT) n_late++;
+    if (n_started == 1) late_first = late;
+    late_last = late;
 }
 
 /* Every finished conversion: collect the result */
@@ -228,7 +237,7 @@ int main(void)
     (void)RCC_APB2ENR;
     GPIOA_MODER |= 3u << 6;                             /* PA3 = analog */
     ADC_CCR = (ADC_CCR & ~(3u << 16)) | (1u << 23);     /* ADCPRE = /2: 72 MHz APB2 -> 36 MHz ADC clock; TSVREFE: VREFINT on */
-    ADC1_SMPR2 = (ADC1_SMPR2 & ~(7u << 9)) | (3u << 9);  /* channel 3: sample for 56 ADC cycles */
+    ADC1_SMPR2 &= ~(7u << 9);                           /* channel 3: sample for 3 ADC cycles: 15 per conversion, up to 2.4 MSPS */
     ADC1_SMPR1 |= 7u << 21;                             /* channel 17: 480 cycles (VREFINT needs at least 10 us) */
     ADC1_CR2   |= 1u << 0;                              /* ADON: power up the ADC */
     uint32_t t0 = DWT_CYCCNT;
@@ -275,11 +284,15 @@ int main(void)
                 while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
                 TIM1_SR = ~(1u << 1);                   /* clear it */
                 uint32_t cnt = TIM1_CNT;                /* where the timer is now */
+                last = DWT_CYCCNT;
+                if (i == 0) first = last;
                 samples[i] = (uint16_t)adc_read(3);
                 uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
                 if (late < late_min) late_min = late;
                 if (late > late_max) late_max = late;
                 if (late > LATE_LIMIT) n_late++;
+                if (i == 0) late_first = late;
+                late_last = late;
                 if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
             }
 #elif MODE == 2
@@ -302,11 +315,11 @@ int main(void)
             ADC1_CR2   |= 1u << 8;                      /* DMA: a request after every conversion */
             ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising */
             idle = idle_loop(WINDOW);                   /* the burst runs in hardware meanwhile */
+            uint32_t ndtr = DMA2_S0NDTR;                /* results still to come: 0 unless a trigger was skipped */
             uint32_t t_start = DWT_CYCCNT;
             while (!(DMA2_LISR & (1u << 5))             /* TCIF0: should already be set */
                    && DWT_CYCCNT - t_start < NSAMP * PERIOD) {}
             ADC1_CR2   &= ~((3u << 28) | (1u << 8));    /* trigger off, DMA off */
-            uint32_t ndtr = DMA2_S0NDTR;                /* results not moved: 0 if the burst completed */
             uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0 */
             DMA2_S0CR  &= ~(1u << 0);                   /* stream off */
             uint32_t t1 = DWT_CYCCNT;
@@ -337,6 +350,10 @@ int main(void)
             uart_field(" dma_err=", dma_err);
 #else
             uart_field(" missed=",  missed);
+            /* Ticks lost without a trace: two ticks while CC1IF was still set count as one.
+               Each lost tick moves the last sample one whole PERIOD later than its lateness says */
+            int32_t drift = (int32_t)(last - first + late_first - late_last - (NSAMP - 1) * PERIOD);
+            uart_field(" lost=",    drift > (int32_t)(PERIOD / 2) ? (uint32_t)(drift + PERIOD / 2) / PERIOD : 0u);
             uart_field(" late_min=", late_min);
             uart_field(" late_max=", late_max);
             uart_field(" n_late=",   n_late);

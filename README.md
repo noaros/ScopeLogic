@@ -2245,6 +2245,33 @@ All runs use the light load (`LOAD_CYCLES 288u`) and acquisition first, as in St
                uint32_t ndtr = DMA2_S0NDTR;                /* results still to come: 0 unless a trigger was skipped */
    ```
    and delete the later line `uint32_t ndtr = DMA2_S0NDTR;  /* results not moved: ... */`. The wait for TCIF0 stays, so the burst still finishes before the DMA is turned off.
+
+   **Catch ticks lost without a trace.** If polling or the handlers fall a whole period behind, two ticks arrive while CC1IF is still set, and the flag can only hold one. `missed` doesn't see that: it only checks whether the previous sample was finished. Each lost tick pushes the last sample one whole `PERIOD` later than its lateness says. The lateness of the first and last samples is known, so the number of lost ticks can be worked out from `span`. Add two globals to the `volatile uint32_t late_min, late_max, n_late` line:
+   ```c
+   volatile uint32_t late_min, late_max, n_late, late_first, late_last;
+   ```
+   At the end of `TIM1_CC_IRQHandler`, after `if (late > LATE_LIMIT) n_late++;`, add:
+   ```c
+       if (n_started == 1) late_first = late;
+       late_last = late;
+   ```
+   In the polling loop, record the time again, after `uint32_t cnt = TIM1_CNT;`:
+   ```c
+                   last = DWT_CYCCNT;
+                   if (i == 0) first = last;
+   ```
+   and after `if (late > LATE_LIMIT) n_late++;`:
+   ```c
+                   if (i == 0) late_first = late;
+                   late_last = late;
+   ```
+   In the line, after `uart_field(" missed=",  missed);`, add:
+   ```c
+               /* Ticks lost without a trace: two ticks while CC1IF was still set count as one.
+                  Each lost tick moves the last sample one whole PERIOD later than its lateness says */
+               int32_t drift = (int32_t)(last - first + late_first - late_last - (NSAMP - 1) * PERIOD);
+               uart_field(" lost=",    drift > (int32_t)(PERIOD / 2) ? (uint32_t)(drift + PERIOD / 2) / PERIOD : 0u);
+   ```
 4. **Check 3-cycle sampling at 100 kHz** before going faster. From `firmware/`: `make flash` (MODE 3, FS 100000 from `main.c`). From the repo root, run `python3 analysis/burst.py` three times: peak-to-peak and offset should match Step 14's DMA run within 3% and 50 mV.
 5. **Add `analysis/sweep.py`:**
    ```python
@@ -2281,22 +2308,25 @@ All runs use the light load (`LOAD_CYCLES 288u`) and acquisition first, as in St
        args = ap.parse_args()
 
        key = "ndtr" if args.mode == 3 else "missed"
-       print(f"MODE {args.mode}, {args.lines} lines per rate; a rate passes if {key}=0 on every line")
-       print(f"{'fs (kHz)':>9} {'cycles':>6} {'worst ' + key:>12} {'load %':>13} {'late_max':>9}  result")
+       rule = "ndtr=0" if args.mode == 3 else "missed=0 and lost=0"
+       print(f"MODE {args.mode}, {args.lines} lines per rate; a rate passes if {rule} on every line")
+       print(f"{'fs (kHz)':>9} {'cycles':>6} {'worst ' + key:>12} {'lost':>5} {'load %':>13} {'late_max':>9}  result")
        for fs in args.fs:
            subprocess.run(["make", "-C", "firmware", "flash", f"MODE={args.mode}", f"FS={fs}"],
                           check=True, capture_output=True)
            rows = lines_from_board(args.port, args.lines)
            worst = max(int(r[key]) for r in rows)
+           lost = max(int(r.get("lost", 0)) for r in rows)  # polling and interrupts: ticks lost without a trace
            loads = [int(r["load"]) / 100 for r in rows]
            late = max(int(r["late_max"]) for r in rows) if args.mode != 3 else None
-           print(f"{fs / 1e3:9g} {144_000_000 // fs:6d} {worst:12d} {min(loads):6.2f}-{max(loads):<6.2f} "
-                 f"{'-' if late is None else late:>9}  {'pass' if worst == 0 else 'FAIL'}")
+           ok = worst == 0 and lost == 0
+           print(f"{fs / 1e3:9g} {144_000_000 // fs:6d} {worst:12d} {'-' if args.mode == 3 else lost:>5} "
+                 f"{min(loads):6.2f}-{max(loads):<6.2f} {'-' if late is None else late:>9}  {'pass' if ok else 'FAIL'}")
 
    if __name__ == "__main__":
        main()
    ```
-   It runs `make -C firmware flash MODE=... FS=...` for each rate, reads 15 lines, and prints one row per rate.
+   It runs `make -C firmware flash MODE=... FS=...` for each rate, reads 15 lines, and prints one row per rate. Polling and interrupts pass only with `missed=0` and `lost=0` on every line, DMA with `ndtr=0`.
 6. **Sweep each mode** from the repo root. Each rate takes about 25 s.
    ```
    python3 analysis/sweep.py 1 200000 300000 400000 600000
@@ -2320,3 +2350,79 @@ Predictions (all with the light load, built at `-O0`):
 - `burst.py` at each mode's highest passing rate: frequency within 0.1% of the generator's, peak-to-peak within 3% of the scope's.
 
 Write down each sweep table, and the three `burst.py` results with their plots.
+
+**Measured:**
+
+Step 4, 3-cycle sampling at 100 kHz (MODE 3, 2 kHz sine), three runs: **1986–1988 mVpp, offset 1645–1647 mV**, frequency 1999.8–2000.0 Hz. That matches Step 14's DMA run (1985–1988 mVpp, 1645–1646 mV). The residual is slightly higher: 9.2–11.2 mV rms against 8.1–9.8.
+
+**A hole in the check, found on the way.** The first interrupt sweep *passed* at 800 kHz with `missed=0`, at 100% load and `late_max` 175 of a 180-cycle period. A test build that printed `span` showed 179,994–179,998 cycles against the 179,820 expected. Without lost ticks, the last sample would have had to start about 199 cycles late, more than a whole period. So ticks were merging in CC1IF, and `missed` couldn't see it. The `lost` field above was added for that, and the polling and interrupt sweeps were run again with it.
+
+Sweeps, 15 lines per rate, light load, acquisition first:
+
+| Mode | fs | Cycles per sample | Worst `missed` / `ndtr` | Worst `lost` | Load | Result |
+|---|---|---|---|---|---|---|
+| Polling | 200 kHz | 720 | 0 | 0 | 100% | **pass** |
+| | 300 kHz | 480 | 4 | 0 | 100% | fail |
+| | 400 kHz | 360 | 12 | 1 | 100% | fail |
+| | 600 kHz | 240 | 957 | 162 | 100% | fail |
+| Interrupts | 400 kHz | 360 | 0 | 0 | 58.1–58.2% | pass |
+| | 600 kHz | 240 | 0 | 0 | 87.2–87.3% | **pass** |
+| | 800 kHz | 180 | 0 | **100** | 99.99–100% | fail |
+| DMA | 1 MHz | 144 | 0 | – | 0.00% | pass |
+| | 2 MHz | 72 | 0 | – | 0.00–0.50% | pass |
+| | 2.4 MHz | 60 | 0 | – | 0.00–0.60% | **pass** |
+| | 3 MHz | 48 | 499 | – | 0.00–0.75% | fail |
+
+- **Polling** fails at 300 kHz only on the lines where SysTick hits a sample (`late_max` 381), as predicted. At 600 kHz it can't keep up even without SysTick: 240 cycles is less than one polled sample takes.
+- **Interrupts** hold 600 kHz at 87% load. The `lost` bookkeeping added a few cycles to the handler: the first sweep, without it, measured 82.4%. At 800 kHz up to 100 ticks per burst merged, with `missed` still 0.
+- **DMA** at 3 MHz shows `ndtr=499`: the ADC ignored every other trigger, which arrived while the previous conversion was still running, as predicted. Its `load` at high rates isn't really zero: the window is short (60,120 cycles at 2.4 MHz), so one loop pass is 0.035%, and one SysTick in the window shows up as 0.5%.
+
+Step 7, sines at FS / 50 at each mode's highest passing rate:
+
+| Mode, fs | Generator | Frequency measured | Peak-to-peak | Offset | Residual rms / worst |
+|---|---|---|---|---|---|
+| Polling, 200 kHz | 4 kHz | 4000.0–4000.2 Hz | 1985–1989 mV | 1644–1646 mV | 8.3–9.5 / 37–62 mV |
+| Interrupts, 600 kHz | 12 kHz | 11999.6–12000.3 Hz | 1984 mV | 1644–1645 mV | 8.1–8.5 / 29–36 mV |
+| DMA, 2.4 MHz | 48 kHz | 47984.9–48003.9 Hz | 1985–1988 mV | 1654 mV | 11.9–13.3 / 67–69 mV |
+
+All within 0.04% of the generator's frequency and 1% of 2 Vpp. The DMA window could hide one ignored trigger, but the 2.4 MHz residual is flat across the burst: one skipped sample would show as a jump of about 126 mV.
+
+![Polling at 200 kHz, 4 kHz sine](docs/step15-mode1.png)
+![Interrupts at 600 kHz, 12 kHz sine](docs/step15-mode2.png)
+![DMA at 2.4 MHz, 48 kHz sine](docs/step15-mode3.png)
+
+### Step 15 summary
+
+**Step 15 finds each mode's highest sustained sample rate under the 1 kHz background load: polling 200 kHz, interrupts 600 kHz, DMA 2.4 MHz, the ADC's own limit. DMA samples 4× faster than interrupts and 12× faster than polling, at 0% CPU.**
+
+**What changed:**
+1. **`Makefile`:** `make MODE=2 FS=600000` builds with those values, and always rebuilds.
+2. **`main.c`:** `FS` and `MODE` can come from the command line, and an `FS` that doesn't divide 144 MHz stops the build. A0 samples for 3 ADC cycles (60 CPU cycles per conversion). DMA reads `NDTR` when the window ends. Polling and interrupts report `lost`: ticks that merged in CC1IF.
+3. **`analysis/sweep.py`:** flashes one mode at a list of rates and reports pass or fail for each.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| 3-cycle sampling at 100 kHz | as Step 14 within 3% / 50 mV | 1986–1988 mVpp, 1645–1647 mV |
+| Polling max | about 200 kHz | 200 kHz (300 kHz fails) |
+| Interrupt max | about 600 kHz, 85–90% load | 600 kHz at 87% (800 kHz fails) |
+| DMA max | 2.4 MHz; 3 MHz `ndtr` about 500 | 2.4 MHz; 3 MHz `ndtr` 499 |
+| Sines at FS / 50 | within 0.1%, 3% | within 0.04%, 1% |
+
+**The benchmark, complete** (100 kHz unless noted, 1 kHz 2 µs background load, built at `-O0`):
+
+| | Polling | Interrupts (acquisition first) | DMA |
+|---|---|---|---|
+| CPU load at 100 kHz | 100% | 14.6% | 0.00% |
+| Worst lateness after the tick | 2.5 µs | 56 ns | fixed by hardware |
+| Clock jitter (PE9, scope) | about 5 ns | about 5 ns | about 5 ns |
+| Highest sustained rate | 200 kHz | 600 kHz | **2.4 MHz** |
+
+Filling in the README's opening bullet from these: DMA cut CPU load from **100%** (polling) to **0%**, cut sampling jitter from **2.5 µs** (polling under load) to the clock's own **about 5 ns**, and raised the maximum sustained rate **4×** over interrupts (12× over polling) to **2.4 MSPS**.
+
+**What you learned along the way:**
+- **A pass means as much as the check behind it.** `missed` couldn't see ticks that merged in a single flag, so 800 kHz looked fine. Checking `span` against the lateness of the first and last samples caught it.
+- **Find the limit by pushing past it.** Each sweep went one rate above the expected maximum, so the table shows both sides of the edge.
+- **CPU modes get worse with load, and DMA doesn't.** Polling's limit was set by SysTick, not by its own speed. Interrupts were fine until their own handlers filled the period. DMA stopped only at the ADC's conversion time.
+- **Short sampling times are fine for a strong source that changes slowly.** The capacitor starts from the previous sample, so it only has to settle the difference.
