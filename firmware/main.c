@@ -45,8 +45,18 @@
 #define TIM1_ARR    (*(volatile uint32_t *)0x4001002C)
 #define TIM1_CCR1   (*(volatile uint32_t *)0x40010034)
 #define TIM1_BDTR   (*(volatile uint32_t *)0x40010044)
+#define TIM1_CNT    (*(volatile uint32_t *)0x40010024)
+#define SYST_CSR    (*(volatile uint32_t *)0xE000E010)
+#define SYST_RVR    (*(volatile uint32_t *)0xE000E014)
+#define SYST_CVR    (*(volatile uint32_t *)0xE000E018)
 
 #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
+#define PERIOD (144000000u / FS)                        /* CPU cycles per sample: 1440 */
+
+#define LOAD 1                                          /* 1: background SysTick load on, 0: off */
+#define SYSTICK_CYCLES 144007u                          /* about 1 kHz; deliberately not a multiple of PERIOD */
+#define LOAD_CYCLES    288u                             /* 2 us of busy work per interrupt */
+#define LATE_LIMIT     100u                             /* a sample more than this many cycles late counts as late */
 
 /* Globals: the startup code sets these up before main() runs */
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
@@ -54,6 +64,17 @@ uint32_t toggles;                                       /* .bss: starts at 0 */
 
 #define NSAMP 1000
 uint16_t samples[NSAMP];                                /* .bss: 2,000 bytes for one burst */
+volatile uint32_t systicks;                             /* .bss: counted by SysTick_Handler */
+
+/* The background load. This replaces the weak SysTick_Handler in startup.c */
+void SysTick_Handler(void)
+{
+    GPIOF_BSRR = 1u << 14;                              /* PF14 (D4) high: handler running */
+    uint32_t t0 = DWT_CYCCNT;
+    while (DWT_CYCCNT - t0 < LOAD_CYCLES) {}            /* stand-in for real work */
+    systicks++;
+    GPIOF_BSRR = 1u << (14 + 16);                       /* PF14 low */
+}
 
 /* Send one byte: wait until the transmitter can take it (TXE), then hand it over */
 static void uart_putc(char c)
@@ -127,6 +148,7 @@ int main(void)
     GPIOB_MODER = (GPIOB_MODER & ~3u) | 1u;
     GPIOB_BSRR  = 1u << 0;                                  /* LD1 on: clock switch finished */
     GPIOF_MODER = (GPIOF_MODER & ~(3u << 30)) | (1u << 30);
+    GPIOF_MODER = (GPIOF_MODER & ~(3u << 28)) | (1u << 28);   /* PF14 (D4) = output: SysTick marker */
 
     /* USART3 on PD8 (TX), wired to the ST-LINK's virtual serial port: 115200 baud, 8N1 */
     RCC_APB1ENR |= 1u << 18;                            /* USART3 clock */
@@ -166,8 +188,13 @@ int main(void)
     TIM1_BDTR  = 1u << 15;                              /* MOE: TIM1 is an "advanced" timer, its outputs stay off without this */
     TIM1_EGR   = 1u << 0;                               /* UG: load PSC, ARR and CCR1 now */
     TIM1_CR1   = 1u << 0;                               /* CEN: start counting */
+#if LOAD
+    SYST_RVR = SYSTICK_CYCLES - 1;                      /* counts down from RVR to 0, then interrupts */
+    SYST_CVR = 0;                                       /* start from the top */
+    SYST_CSR = 7u;                                      /* CLKSOURCE = CPU clock, TICKINT = interrupt, ENABLE */
+#endif
 
-    uint32_t next = DWT_CYCCNT;
+    uint32_t next = DWT_CYCCNT, prev_systicks = 0;
     for (;;) {
         next += period;                                 /* next deadline, from the last one, not from now */
         while ((int32_t)(DWT_CYCCNT - next) < 0) {}     /* wait for it (works across wraparound) */
@@ -176,13 +203,19 @@ int main(void)
 
         if (toggles % 100000u == 0) {                   /* once a second */
             uint32_t missed = 0, first = 0, last = 0;
+            uint32_t late_min = PERIOD, late_max = 0, n_late = 0;
             TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
             for (uint32_t i = 0; i < NSAMP; i++) {
                 while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
-                TIM1_SR = ~(1u << 1);                   /* clear it (writing 0 clears a flag, writing 1 leaves it alone) */
+                TIM1_SR = ~(1u << 1);                   /* clear it */
+                uint32_t cnt = TIM1_CNT;                /* where the timer is now */
                 last = DWT_CYCCNT;
                 if (i == 0) first = last;
                 samples[i] = (uint16_t)adc_read(3);
+                uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
+                if (late < late_min) late_min = late;
+                if (late > late_max) late_max = late;
+                if (late > LATE_LIMIT) n_late++;
                 if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
             }
             uint32_t span = last - first;               /* cycles from the first sample's start to the last's */
@@ -200,6 +233,12 @@ int main(void)
             uart_field(" fs=",      FS);
             uart_field(" span=",    span);
             uart_field(" missed=",  missed);
+            uint32_t now_systicks = systicks;           /* read once: an interrupt can come while the line is sent */
+            uart_field(" systicks=", now_systicks - prev_systicks);
+            prev_systicks = now_systicks;
+            uart_field(" late_min=", late_min);
+            uart_field(" late_max=", late_max);
+            uart_field(" n_late=",   n_late);
             uart_field(" min=",     lo);
             uart_field(" max=",     hi);
             uart_puts("\r\n");

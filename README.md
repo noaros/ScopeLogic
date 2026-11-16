@@ -1510,8 +1510,9 @@ Two details:
    ```
    The lateness is worked out *after* `adc_read()`, so the division doesn't delay the conversion. Add four fields to the line, after `missed=`:
    ```c
-               uart_field(" systicks=", systicks - prev_systicks);
-               prev_systicks = systicks;
+               uint32_t now_systicks = systicks;           /* read once: an interrupt can come while the line is sent */
+               uart_field(" systicks=", now_systicks - prev_systicks);
+               prev_systicks = now_systicks;
                uart_field(" late_min=", late_min);
                uart_field(" late_max=", late_max);
                uart_field(" n_late=",   n_late);
@@ -1538,3 +1539,54 @@ Two details:
 - The LA shows PF14 pulses about 2.0 µs wide, 1.000 ms apart.
 
 Write down `late_min` and `late_max` for both runs, and for `LOAD 1` how many lines out of 30 had late samples, the largest `n_late` and the largest `late_max`. Also write down the LA pulse width and period. In µs (cycles ÷ 144), `late_max` − `late_min` is the jitter of polled sampling with this load.
+
+**Measured:**
+
+`LOAD 0`, 20 lines: `systicks=0`, `missed=0`, `n_late=0` and `late_min` **19** on every line; `late_max` **29**, sometimes 33. That's a spread of **10–14 cycles (about 0.1 µs)**, one pass of the wait loop.
+
+`LOAD 1`, 31 lines:
+
+| Lines | `n_late` | `late_max` | Lines |
+|---|---|---|---|
+| No late samples | 0 | 29 | 22 |
+| One sample a little late, under the limit | 0 | 63, 91 | 2 |
+| Late samples | 2–10 | 183–385 | 7 |
+
+- `systicks` = **1000**, twice 999; `missed=0`; `span` 1,438,550–1,438,570.
+- The worst sample is **385 − 19 = 366 cycles (2.54 µs)** late, a bit more than the 330 predicted (see the LA below). It shows up about once every 7 lines (t = 4, 11, 18).
+- The late lines come in **pairs about 7 lines apart** (t = 4–5, 11–12, 18–19, 26). Over one second, 1,000 interrupts at 144,007 cycles each come 7,000 cycles later than 1,000 exact milliseconds. That's 4 sample periods plus 1,240 cycles, so relative to the sample ticks each burst sees the interrupt about **200 cycles earlier** than the one before. A delay window about 366 cycles wide then covers about 2 lines out of every 7.
+
+LA1010, CH0 on PF14 at 100 MSa/s: high **2.22 µs**, period **1.00004 ms**, **999.96 Hz** (predicted 1.000049 ms, 999.95 Hz).
+
+2.22 µs is 320 cycles: 288 of busy-waiting plus about 32 for the rest of the handler between the two PF14 writes, compiled without optimization. Add about 12 cycles to enter the interrupt and about 10 to leave it, the handler code outside the PF14 pulse, and one pass of the wait loop, and you get about 366.
+
+**A bug found on the way:** the first `LOAD 1` run showed `systicks` = 998–999, not 1000. Reading the SysTick registers over SWD showed the interrupt running at the right rate. The code read `systicks` twice: once for the field, and again 1.1 ms later for `prev_systicks`, after the field had been sent. An interrupt nearly always came in between, and that one was never counted. Now it reads the value once (`now_systicks`). **Read a variable an interrupt changes once, and use that copy.**
+
+### Step 11 summary
+
+**Step 11 adds a 1 kHz background interrupt and measures each sample's lateness from TIM1's counter. Polled sampling goes from about 0.1 µs of spread to 2.5 µs once the CPU has other work.**
+
+**What changed:**
+1. **`SysTick_Handler`** runs every 144,007 cycles (999.95 Hz), busy-waits 288 cycles and holds PF14 (D4) high while it runs. `LOAD` turns it on or off.
+2. **Each sample reads `TIM1_CNT`** right after CC1IF. `counter − 720` is how many cycles after its tick the sample started. The line reports `systicks`, `late_min`, `late_max` and `n_late` (more than 100 cycles late).
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| `LOAD 0` spread (`late_max` − `late_min`) | about 12 cycles | 10–14 cycles (19 to 29–33) |
+| `LOAD 0` `n_late` / `systicks` | 0 / 0 | 0 / 0 |
+| `LOAD 1` `systicks` | 1000, sometimes 999 | 1000, twice 999 |
+| `LOAD 1` lines with late samples | about 1 in 4 | 7 of 31, in pairs |
+| `LOAD 1` worst lateness | about 330 cycles above `late_min` | 366 cycles (2.54 µs) |
+| `missed` | 0 | 0 |
+| PF14 pulse | a little over 2.0 µs, every 1.000 ms | 2.22 µs, 1.00004 ms (999.96 Hz) |
+
+**Jitter of polled sampling at 100 kHz:** 10–14 cycles (about **0.1 µs**) on an idle CPU, and **2.54 µs** with a 1 kHz, 2 µs background interrupt.
+
+**What you learned along the way:**
+- **An interrupt only delays a sample if it's running when the tick arrives.** One that lands while the ADC is converting costs nothing: the input was already sampled on time.
+- **Whether an interrupt hits depends on its phase relative to the sample clock.** At exactly 144,000 cycles it would be locked to the samples: always late or never. 144,007 makes it drift, so the late samples show up a couple of lines at a time.
+- **Measure the delay with the clock that made the tick.** `TIM1_CNT` counts the same 144 MHz cycles as the sample period, so `counter − CCR1` is the lateness in cycles, with no extra wiring.
+- **Read a variable an interrupt changes once, and use that copy.** Reading it twice lost one tick per line here.
+- **A logic analyzer pin shows how long a handler really runs.** The PF14 pulse showed 2.22 µs, which accounts for most of the gap to the 2.54 µs worst lateness.
