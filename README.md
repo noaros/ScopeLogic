@@ -2607,3 +2607,59 @@ Write down the five 300–600 Hz values for each run, and the top peaks.
 - **Ranking peaks hides how big they are.** A top-three list said "no 400–500 Hz in polling", when the real change was a different component moving ahead of it. Measuring the band's rms answers the actual question.
 - **Change one thing at a time, and repeat the first run at the end.** A and A again agreed, so nothing drifted during the test.
 - **Sleeping safely:** `cpsid i`, check the flag, `wfi`, then `cpsie i`. A pending interrupt wakes `WFI` even while PRIMASK holds it off, so none can be missed between the check and the sleep.
+
+
+## Step 17 — Does the wave ride on the generator's sine?
+
+**Goal:** narrow down where the 400–500 Hz wave comes from. Step 16 ruled out the CPU. The wave could still be:
+- **part of the generator's sine:** for example the sine's amplitude or shape changing slightly about 450 times a second;
+- **added on the way in, whatever the input:** noise from the generator's output stage, the ground connections between generator, scope, board and PC, or mains pickup (400–500 Hz is near the 7th–9th harmonics of 50 or 60 Hz).
+
+The test: replace the sine with a **steady DC level of 1.65 V**, the same as the sine's center, and change nothing else. If the wave is still in the samples, it doesn't need the sine. If it's gone, it's tied to the sine.
+
+Three runs, sine, then DC, then sine again, all with the Step 16 run B build (`MODE=3 LOAD=0`: DMA, no background load), so the results compare directly with Step 16. During the DC run the scope looks at the generator's output too, at high sensitivity. If the generator itself puts out a 400–500 Hz ripple of a few mV, it may show there.
+
+1. **Wiring.** No change: generator on A0 and on scope CH1.
+2. **Change `analysis/burst.py`** so a flat input gets the same residual spectrum. Replace from `print(f"residual: rms ...` through the end of the `else:` branch with:
+   ```python
+           print(f"residual: rms {resid.std():.1f} mV, worst {np.abs(resid).max():.0f} mV")
+       else:
+           resid = mv - mv.mean()                          # no sine (e.g. a DC input): the residual is what's left around the mean
+           print("no sine found (swing under 500 mV or fewer than 2 rising crossings): "
+                 f"spread {mv.std():.1f} mV rms around the mean, worst {np.abs(resid).max():.0f} mV")
+
+       spec = np.abs(np.fft.rfft(resid * np.hanning(len(resid))))
+       freqs = np.fft.rfftfreq(len(resid), dt)
+       top = np.argsort(spec[1:])[::-1][:3] + 1            # skip 0 Hz
+       print("residual peaks: " + ", ".join(f"{freqs[i]:.0f} Hz" for i in top))
+       x = np.fft.rfft(resid)                              # no window: the bins' power adds up to the rms
+       band = (freqs >= 300) & (freqs <= 600)
+       band_rms = np.sqrt(2 * np.sum(np.abs(x[band]) ** 2)) / len(resid)
+       print(f"residual 300-600 Hz: {band_rms:.1f} mV rms")
+   ```
+   The spectrum lines move out of the sine branch, one level less indented, so they run for both cases.
+3. From `firmware/`: `make flash MODE=3 LOAD=0`.
+4. **Run 1, sine.** Generator as before: 2 kHz sine, 2 Vpp, 1.65 V offset. From the repo root, run `python3 analysis/burst.py` five times.
+5. **Run 2, DC.** In the generator menu (**[Wave Gen]**), change the waveform to **DC** and set its level (it may be labelled Offset) to **1.65 V**. If your generator has no DC waveform, keep the sine and turn the amplitude down as far as it goes. `burst.py` treats anything under 500 mV of swing as no sine, and a 2 kHz remainder falls outside the 300–600 Hz band.
+   1. On the scope, check CH1 reads a steady **1.65 V** (Measure → Average) before going on.
+   2. Run `python3 analysis/burst.py` five times. Save one plot: `python3 analysis/burst.py --plot docs/step17-dc.png`.
+   3. **Look at the generator's output closely.** Set CH1's probe switch and its menu to **1X**, coupling to **AC** (that removes the 1.65 V so only the ripple is left), V/div to the **smallest** setting (turn the vertical knob all the way), and H to **1 ms/div**. A 400–500 Hz ripple repeats about every 2.2 ms, a little over 2 divisions. Note whether you see a repeating ripple, and its Pk-Pk from Measure. Put CH1 back to **10X**, **DC** and **500 mV/div** afterwards.
+6. **Run 3, sine again.** Set the generator back to the 2 kHz sine (2 Vpp, 1.65 V offset), and run `python3 analysis/burst.py` five times.
+7. From `firmware/`: `make flash` with no arguments, back to the default build.
+
+What the results mean:
+
+| Runs 1 and 3, sine | Run 2, DC | Meaning |
+|---|---|---|
+| about 5 mV | about 5 mV, 400–500 Hz on top | The wave doesn't need the sine. It's added on the way in. If the scope shows the ripple at the generator, the generator makes it. If not, look at grounds and mains. |
+| about 5 mV | 1–2 mV, no 400–500 Hz | The wave comes with the sine: the generator's sine itself varies at about 450 Hz. |
+| runs 1 and 3 disagree | – | Something changed during the test. Repeat it. |
+
+I don't have a prediction this time: either outcome narrows it down. The scope may not resolve a ripple this small, since 5 mV rms is about 14 mV peak-to-peak. If it shows nothing, that doesn't rule the generator out.
+
+**Done when:**
+- Runs 1 and 3 agree with each other and with Step 16's run B (4.6–5.0 mV).
+- Run 2 has its five values, and the scope check of the generator's output is noted.
+- You can say which row of the table the results match.
+
+Write down the five 300–600 Hz values and the top peaks for each run, the DC run's spread, and what the scope showed.
