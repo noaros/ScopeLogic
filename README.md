@@ -1908,3 +1908,67 @@ Predictions:
 - The scope shows the PE9 edge band and you've measured its width.
 
 Write down the range of `burst` at each load, the script's frequency, amplitude, offset and residual at each load, the PE9 band width, and whether the 400–500 Hz wave is in the plot.
+
+**Measured** (SysTick at the highest priority throughout):
+
+| Load | Lines | `ndtr` / `dma_err` | `systicks` | `burst` (cycles) |
+|---|---|---|---|---|
+| 2 µs per ms (`LOAD_CYCLES 288u`) | 30 | 0 / 0 on every line | 1000, twice 999 | 1,439,399–1,439,403 |
+| 100 µs per ms (`LOAD_CYCLES 14400u`) | 30 | 0 / 0 on every line | 1000, twice 999 | 1,439,390–1,439,414; twice 1,439,832 and 1,439,875 |
+
+- `burst` is about 1,439,400, within the predicted 1,438,850–1,440,300, and steady to a few cycles. At the heavy load, two lines came out about 450 cycles longer: SysTick held up `main()` noticing TCIF0. That's when the CPU *saw* the end, not when any sample was taken.
+
+`analysis/burst.py`, three runs at each load:
+
+| Load | Frequency | Fitted peak-to-peak | Fitted offset | Residual rms / worst |
+|---|---|---|---|---|
+| 2 µs per ms | 1999.8–2000.0 Hz | 1985–1988 mV | 1645–1648 mV | 7.8–9.5 / 34–49 mV |
+| 100 µs per ms | 1999.9–2000.0 Hz | 1986–1988 mV | 1644–1646 mV | 7.7–8.7 / 26–35 mV |
+
+The heavy load, 10% of the CPU at the highest priority, changes nothing in the samples. In Step 12 a 2 µs load at the same priority made samples 2.5 µs late.
+
+![A0 burst in DMA mode: 20 cycles of the 2 kHz sine with the fitted sine, and the residual below](docs/step13-sine.png)
+
+**PE9 on the scope** (CH2, clip line, H = 2 ns/div, infinite persistence, about 30 s each):
+- **D = 10 µs** (the edge after the triggered one): a solid band **4.76 ns** wide at mid-height.
+- **D = 0** (the triggered edge itself): almost no width, with a few outliers up to about half a division (**about 1 ns**) away. That's the scope's own error.
+
+So the sample clock's period varies by **about 4–5 ns peak to peak** over 10 µs, from about 30 s of captures. That's 5 times the 1 ns I predicted. I'd ignored that the board's clock chain has two PLLs: the 8 MHz HSE comes from the ST-LINK chip's own clock output, and the STM32's PLL multiplies it by 18. Each PLL adds a little timing noise, and it adds up over the 1,440 cycles of a period. `TIM1_CNT` counts that same clock, so the lateness measured in Steps 11 and 12 can't see this jitter. It sits underneath every mode equally. A crystal on the Nucleo's HSE footprint (X3, not fitted) would likely reduce it.
+
+**The 400–500 Hz wave** is in DMA mode too: the 400 and 500 Hz bins were the top two in all 4 bursts checked, and the plot shows it. So far it appears with interrupts and DMA, but not in the one polling run. In DMA mode the CPU waits by reading `DMA2_LISR`, a peripheral register like polling's `ADC1_SR`, so "what the CPU reads while it waits" doesn't explain it either. Still open. The one difference left between polling and the other two is how the conversion starts: polling sets SWSTART itself before each conversion, while here the conversion starts from a trigger. A repeat polling run would also rule out that the wave simply wasn't there at that moment.
+
+### Step 13 summary
+
+**Step 13 hands sampling to the hardware: TIM1's CC1 event triggers each conversion and DMA2 stores each result. The CPU only sees the end of the burst. SysTick at the highest priority, even taking 10% of the CPU, no longer affects a single sample.**
+
+**What changed:**
+1. **`ADC1_CR2`:** external trigger `EXTSEL` = TIM1_CC1, `EXTEN` = rising edge, `DMA` on for the burst.
+2. **DMA2 stream 0, channel 0:** `ADC1_DR` → `samples[]`, 16-bit, memory address stepping, 1,000 transfers, then TCIF0.
+3. **`main()`** sets up the stream, turns the trigger on, waits for TCIF0 (giving up after 20 ms), and turns the trigger and DMA off. The line reports `burst`, `ndtr` and `dma_err`.
+4. **`burst.py`** prints whichever of `span`, `missed`, `burst`, `ndtr` and `dma_err` the board sends.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| `ndtr` / `dma_err`, both loads | 0 / 0 | 0 / 0 on all 60 lines |
+| `systicks`, both loads | 1000, sometimes 999 | 1000, twice 999 at each load |
+| `burst`, light load | about 1,438,850–1,440,300, steady | 1,439,399–1,439,403 |
+| `burst`, heavy load | within about 14,400 of the light load | 1,439,390–1,439,875 |
+| Frequency, both loads | 2 kHz ± 0.1% | 1999.8–2000.0 Hz |
+| Peak-to-peak / offset | as Step 12 | 1985–1988 mV / 1644–1648 mV |
+| PE9 edge band at D = 10 µs | at most about 1 ns | 4.76 ns (scope's own: about 1 ns or less) |
+
+**Sampling jitter so far, at 100 kHz:**
+
+| Mode | Lateness after the tick, idle | Worst lateness with load | Clock jitter, all modes |
+|---|---|---|---|
+| Polling (Step 11) | 10–14 cycles (0.1 µs) | 2.54 µs | about 5 ns |
+| Interrupts, acquisition first (Step 12) | 4 cycles (28 ns) | 56 ns | about 5 ns |
+| DMA (Step 13) | fixed by hardware | unchanged, even at 10% load and top priority | about 5 ns |
+
+**What you learned along the way:**
+- **A hardware trigger plus DMA takes the CPU out of the sampling path.** The CPU's only job is to set up the stream and notice when the transfer is complete, and how late it notices doesn't change the data.
+- **Each DMA request has fixed streams and channels.** ADC1 is on DMA2 stream 0 or 4, channel 0 (RM0090 Table 43).
+- **Check the instrument against itself.** The band at D = 0 showed the scope's own error (about 1 ns) before blaming the 4.76 ns at D = 10 µs on the board.
+- **The clock sets a limit that software can't measure.** `TIM1_CNT` counts the same clock it would be measuring against, so the 5 ns of clock jitter only showed up on the scope.

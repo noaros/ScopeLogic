@@ -57,8 +57,9 @@ def main():
     vdda = int(header["vdda_mV"])
     if "fs" in header:                              # Step 10 on: samples paced by TIM1
         dt = 1 / int(header["fs"])
+        extra = ", ".join(f"{k} {header[k]}" for k in ("span", "missed", "burst", "ndtr", "dma_err") if k in header)
         print(f"burst: {len(s)} samples at {int(header['fs']) / 1e3:g} kHz ({dt * 1e6:.3f} us apart), "
-              f"span {header['span']} cycles, missed {header['missed']}, VDDA {vdda} mV")
+              f"{extra}, VDDA {vdda} mV")
     else:                                           # Step 9: back to back, spacing from the burst time
         burst = int(header["burst"])
         dt = burst / len(s) / CPU_HZ

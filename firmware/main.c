@@ -56,6 +56,12 @@
 #define SHPR3_SYSTICK (*(volatile uint8_t *)0xE000ED23)          /* SysTick's priority byte */
 #define ADC_IRQ     18                                  /* interrupt numbers, RM0090 Table 62 */
 #define TIM1_CC_IRQ 27
+#define DMA2_LISR   (*(volatile uint32_t *)0x40026400)
+#define DMA2_LIFCR  (*(volatile uint32_t *)0x40026408)
+#define DMA2_S0CR   (*(volatile uint32_t *)0x40026410)
+#define DMA2_S0NDTR (*(volatile uint32_t *)0x40026414)
+#define DMA2_S0PAR  (*(volatile uint32_t *)0x40026418)
+#define DMA2_S0M0AR (*(volatile uint32_t *)0x4002641C)
 
 #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
 #define PERIOD (144000000u / FS)                        /* CPU cycles per sample: 1440 */
@@ -64,8 +70,8 @@
 #define SYSTICK_CYCLES 144007u                          /* about 1 kHz; deliberately not a multiple of PERIOD */
 #define LOAD_CYCLES    288u                             /* 2 us of busy work per interrupt */
 #define LATE_LIMIT     100u                             /* a sample more than this many cycles late counts as late */
-#define ACQ_PRIO       0u                               /* priority of the TIM1 and ADC interrupts: 0 is the highest */
-#define SYSTICK_PRIO   1u                               /* priority of the background load */
+#define ACQ_PRIO       1u                               /* priority of the TIM1 and ADC interrupts: 0 is the highest */
+#define SYSTICK_PRIO   0u                               /* priority of the background load */
 
 /* Globals: the startup code sets these up before main() runs */
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
@@ -156,7 +162,7 @@ static uint32_t adc_read(uint32_t channel)
 
 int main(void)
 {
-    RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5);  /* GPIOA-F clocks */
+    RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 22);  /* GPIOA-F and DMA2 clocks */
     (void)RCC_AHB1ENR;
 
     /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
@@ -248,14 +254,28 @@ int main(void)
         toggles++;
 
         if (toggles % 100000u == 0) {                   /* once a second */
-            n_started = 0; n_done = 0; missed = 0;
-            late_min = PERIOD; late_max = 0; n_late = 0;
-            ADC1_SQR3 = 3;                              /* A0 for the whole burst */
-            ADC1_CR1 |= 1u << 5;                        /* EOCIE: interrupt at the end of each conversion */
-            TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
-            TIM1_DIER |= 1u << 1;                       /* CC1IE: interrupt on every tick from now on */
-            while (n_done < NSAMP) {}                   /* the CPU is free here; for now it just waits */
-            uint32_t span = last - first;               /* cycles from the first sample's start to the last's */
+            DMA2_LIFCR  = 0x3Du;                        /* clear stream 0's flags from the last burst */
+            DMA2_S0NDTR = NSAMP;                        /* move 1,000 results */
+            DMA2_S0PAR  = (uint32_t)&ADC1_DR;           /* from the ADC's data register */
+            DMA2_S0M0AR = (uint32_t)samples;            /* to samples[] */
+            DMA2_S0CR   = (1u << 13) | (1u << 11) | (1u << 10);  /* channel 0 (ADC1), 16 bits each side, step the memory address */
+            DMA2_S0CR  |= 1u << 0;                      /* EN: stream on, waiting for requests */
+            ADC1_SQR3   = 3;                            /* A0 */
+            ADC1_SR     = 0;                            /* clear EOC and OVR */
+            ADC1_CR2   |= 1u << 8;                      /* DMA: a request after every conversion */
+            uint32_t t_start = DWT_CYCCNT;
+            ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising: the timer starts each conversion */
+            while (!(DMA2_LISR & (1u << 5))             /* TCIF0: all 1,000 moved */
+                   && DWT_CYCCNT - t_start < 2u * NSAMP * PERIOD) {}  /* give up after twice the expected time */
+            uint32_t burst = DWT_CYCCNT - t_start;
+            ADC1_CR2   &= ~((3u << 28) | (1u << 8));    /* trigger off, DMA off */
+            uint32_t ndtr = DMA2_S0NDTR;                /* results not moved: 0 if the burst completed */
+            uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0: transfer or direct-mode errors */
+            DMA2_S0CR  &= ~(1u << 0);                   /* stream off (already off if it completed) */
+            uint32_t t1 = DWT_CYCCNT;
+            while (DWT_CYCCNT - t1 < 300u) {}           /* let a conversion the timer already started finish */
+            (void)ADC1_DR;
+            ADC1_SR = 0;                                /* so adc_read(17) waits for its own EOC */
             uint32_t vref = adc_read(17);
             uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;
 
@@ -268,14 +288,12 @@ int main(void)
             uart_field("t=",        toggles / 100000u);
             uart_field(" vdda_mV=", vdda_mV);
             uart_field(" fs=",      FS);
-            uart_field(" span=",    span);
-            uart_field(" missed=",  missed);
+            uart_field(" burst=",   burst);
+            uart_field(" ndtr=",    ndtr);
+            uart_field(" dma_err=", dma_err);
             uint32_t now_systicks = systicks;           /* read once: an interrupt can come while the line is sent */
             uart_field(" systicks=", now_systicks - prev_systicks);
             prev_systicks = now_systicks;
-            uart_field(" late_min=", late_min);
-            uart_field(" late_max=", late_max);
-            uart_field(" n_late=",   n_late);
             uart_field(" min=",     lo);
             uart_field(" max=",     hi);
             uart_puts("\r\n");
