@@ -32,10 +32,12 @@ void SVC_Handler(void)        __attribute__((weak, alias("Default_Handler")));
 void DebugMon_Handler(void)   __attribute__((weak, alias("Default_Handler")));
 void PendSV_Handler(void)     __attribute__((weak, alias("Default_Handler")));
 void SysTick_Handler(void)    __attribute__((weak, alias("Default_Handler")));
+void ADC_IRQHandler(void)     __attribute__((weak, alias("Default_Handler")));
+void TIM1_CC_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
 
-/* The 16 Cortex-M4 entries. Peripheral interrupts (timer, ADC, DMA) get added in the steps that use them. */
+/* The 16 Cortex-M4 entries, then the STM32F429's 91 peripheral interrupts (RM0090 Table 62) */
 __attribute__((section(".isr_vector"), used))
-void (*const vectors[16])(void) = {
+void (*const vectors[16 + 91])(void) = {
     (void (*)(void))&_estack,   /*  0: initial stack pointer */
     Reset_Handler,              /*  1 */
     NMI_Handler,                /*  2 */
@@ -49,4 +51,7 @@ void (*const vectors[16])(void) = {
     0,                          /* 13: reserved */
     PendSV_Handler,             /* 14 */
     SysTick_Handler,            /* 15 */
+    [16 ... 16 + 90] = Default_Handler,     /* every peripheral interrupt, unless named below */
+    [16 + 18] = ADC_IRQHandler,
+    [16 + 27] = TIM1_CC_IRQHandler,
 };

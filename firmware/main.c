@@ -49,6 +49,13 @@
 #define SYST_CSR    (*(volatile uint32_t *)0xE000E010)
 #define SYST_RVR    (*(volatile uint32_t *)0xE000E014)
 #define SYST_CVR    (*(volatile uint32_t *)0xE000E018)
+#define ADC1_CR1    (*(volatile uint32_t *)0x40012004)
+#define TIM1_DIER   (*(volatile uint32_t *)0x4001000C)
+#define NVIC_ISER0  (*(volatile uint32_t *)0xE000E100)
+#define NVIC_IPR(n) (*(volatile uint8_t  *)(0xE000E400 + (n)))   /* priority of interrupt n, one byte each */
+#define SHPR3_SYSTICK (*(volatile uint8_t *)0xE000ED23)          /* SysTick's priority byte */
+#define ADC_IRQ     18                                  /* interrupt numbers, RM0090 Table 62 */
+#define TIM1_CC_IRQ 27
 
 #define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
 #define PERIOD (144000000u / FS)                        /* CPU cycles per sample: 1440 */
@@ -57,6 +64,8 @@
 #define SYSTICK_CYCLES 144007u                          /* about 1 kHz; deliberately not a multiple of PERIOD */
 #define LOAD_CYCLES    288u                             /* 2 us of busy work per interrupt */
 #define LATE_LIMIT     100u                             /* a sample more than this many cycles late counts as late */
+#define ACQ_PRIO       0u                               /* priority of the TIM1 and ADC interrupts: 0 is the highest */
+#define SYSTICK_PRIO   1u                               /* priority of the background load */
 
 /* Globals: the startup code sets these up before main() runs */
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
@@ -74,6 +83,39 @@ void SysTick_Handler(void)
     while (DWT_CYCCNT - t0 < LOAD_CYCLES) {}            /* stand-in for real work */
     systicks++;
     GPIOF_BSRR = 1u << (14 + 16);                       /* PF14 low */
+}
+
+/* Burst state, shared between the interrupts and main(): all volatile */
+volatile uint32_t n_started, n_done, missed, first, last;
+volatile uint32_t late_min, late_max, n_late;
+
+/* Every TIM1 tick: start one conversion */
+void TIM1_CC_IRQHandler(void)
+{
+    uint32_t cnt = TIM1_CNT;                            /* where the timer is now */
+    TIM1_SR = ~(1u << 1);                               /* clear CC1IF, or the interrupt comes straight back */
+    if (n_started != n_done) {                          /* the last conversion hasn't been collected yet */
+        missed++;
+        return;
+    }
+    ADC1_CR2 |= 1u << 30;                               /* SWSTART */
+    last = DWT_CYCCNT;
+    if (n_started == 0) first = last;
+    n_started++;
+    if (n_started == NSAMP) TIM1_DIER &= ~(1u << 1);    /* that was the last one: stop the tick interrupts */
+
+    uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
+    if (late < late_min) late_min = late;
+    if (late > late_max) late_max = late;
+    if (late > LATE_LIMIT) n_late++;
+}
+
+/* Every finished conversion: collect the result */
+void ADC_IRQHandler(void)
+{
+    samples[n_done] = (uint16_t)ADC1_DR;                /* reading DR clears EOC, which ends the interrupt */
+    n_done++;
+    if (n_done == NSAMP) ADC1_CR1 &= ~(1u << 5);        /* last one: EOCIE off, so adc_read() can poll again */
 }
 
 /* Send one byte: wait until the transmitter can take it (TXE), then hand it over */
@@ -193,6 +235,10 @@ int main(void)
     SYST_CVR = 0;                                       /* start from the top */
     SYST_CSR = 7u;                                      /* CLKSOURCE = CPU clock, TICKINT = interrupt, ENABLE */
 #endif
+    SHPR3_SYSTICK = SYSTICK_PRIO << 4;                  /* STM32 uses the top 4 bits of each priority byte */
+    NVIC_IPR(TIM1_CC_IRQ) = ACQ_PRIO << 4;
+    NVIC_IPR(ADC_IRQ)     = ACQ_PRIO << 4;
+    NVIC_ISER0 = (1u << TIM1_CC_IRQ) | (1u << ADC_IRQ); /* let both through the NVIC */
 
     uint32_t next = DWT_CYCCNT, prev_systicks = 0;
     for (;;) {
@@ -202,22 +248,13 @@ int main(void)
         toggles++;
 
         if (toggles % 100000u == 0) {                   /* once a second */
-            uint32_t missed = 0, first = 0, last = 0;
-            uint32_t late_min = PERIOD, late_max = 0, n_late = 0;
+            n_started = 0; n_done = 0; missed = 0;
+            late_min = PERIOD; late_max = 0; n_late = 0;
+            ADC1_SQR3 = 3;                              /* A0 for the whole burst */
+            ADC1_CR1 |= 1u << 5;                        /* EOCIE: interrupt at the end of each conversion */
             TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
-            for (uint32_t i = 0; i < NSAMP; i++) {
-                while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
-                TIM1_SR = ~(1u << 1);                   /* clear it */
-                uint32_t cnt = TIM1_CNT;                /* where the timer is now */
-                last = DWT_CYCCNT;
-                if (i == 0) first = last;
-                samples[i] = (uint16_t)adc_read(3);
-                uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
-                if (late < late_min) late_min = late;
-                if (late > late_max) late_max = late;
-                if (late > LATE_LIMIT) n_late++;
-                if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
-            }
+            TIM1_DIER |= 1u << 1;                       /* CC1IE: interrupt on every tick from now on */
+            while (n_done < NSAMP) {}                   /* the CPU is free here; for now it just waits */
             uint32_t span = last - first;               /* cycles from the first sample's start to the last's */
             uint32_t vref = adc_read(17);
             uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;

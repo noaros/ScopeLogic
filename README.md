@@ -1728,3 +1728,76 @@ The priorities decide who wins when the SysTick load and a sample tick collide, 
 - `burst.py`: frequency within 0.1% of 2 kHz, peak-to-peak and offset as in Step 10, 20 clean cycles in the plot.
 
 Write down `late_min` and `late_max` for each setting, and for SysTick first how many lines out of 30 had late samples and the largest `late_max`. Also write down the script's frequency, amplitude, offset and residual.
+
+**Measured** (30 lines for each setting):
+
+| Setting | `late_min` | `late_max` | Lines with late samples | Worst, above normal |
+|---|---|---|---|---|
+| `LOAD 0` | 23 | 27 | 0 | none |
+| `LOAD 1`, SysTick first | 23, twice 19 | 27–29, or 39–383 | 7 (t = 4–5, 11–12, 18–19, 26) | 383 − 23 = 360 cycles, **2.50 µs** |
+| `LOAD 1`, acquisition first | 23, four times 19 | **27 on every line** | 0 | none |
+
+- `missed=0` on every line of every run. `span` is 1,438,552 on nearly every line (1,438,550 on a few with SysTick first), steadier than polling's 1,438,550–1,438,570.
+- **`LOAD 0`:** the spread is **4 cycles (28 ns)**, against polling's 10–14. An interrupt only waits for the current instruction to finish, while a polling loop has to finish a whole pass.
+- **SysTick first** behaves like polling: the same pairs of late lines, and a worst case of 2.50 µs against polling's 2.54 µs.
+- **Acquisition first** removes the late samples completely: the tick interrupt preempts SysTick. `systicks` stays 1000 (twice 999), so the background work is delayed, never skipped.
+- **The 19-cycle lines** show up in both `LOAD 1` runs, on the lines where the interrupt lands near a tick. When the tick arrives while SysTick is running or has just finished, the handler is entered 4 cycles sooner than from `main()`'s wait loop. I haven't worked out exactly why.
+
+`analysis/burst.py`, acquisition first:
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Frequency | 2000.0 Hz | 2000.1 Hz | 1999.9 Hz |
+| Fitted peak-to-peak | 1987 mV | 1989 mV | 1983 mV |
+| Fitted offset | 1640 mV | 1638 mV | 1639 mV |
+| Residual rms / worst | 8.2 / 41 mV | 8.8 / 62 mV | 9.0 / 55 mV |
+
+![A0 burst in interrupt mode: 20 cycles of the 2 kHz sine with the fitted sine, and the residual below](docs/step12-sine.png)
+
+**Open item: a 400–500 Hz wave in the residual.** The plot's residual has a slow wave of about ±10 mV with a period of about 2.4 ms, which the Step 10 plot doesn't have. An FFT of the residual over 4 bursts put it in the 400 and 500 Hz bins every time (each bin is 100 Hz wide for a 10 ms burst). Every sample was on time (`late_max=27`), so it's a voltage error, not a timing one. Swapping one thing at a time:
+
+| Firmware | LA wired to the board | SysTick | 400–500 Hz in the residual |
+|---|---|---|---|
+| Step 12 (interrupts) | yes | on | yes |
+| Step 12 | no | on | yes |
+| Step 11 (polling) | no | on | no |
+| Step 12 | no | off | yes |
+
+It comes with interrupt mode itself, not with the LA, its USB ground or the SysTick load. One difference is what the CPU does during each conversion: polling reads `ADC1_SR` over and over, interrupt mode loops on `n_done` in RAM or runs a handler. But a difference that's the same for every sample would only shift the offset, not make a slow wave, so the cause is still unexplained. The overall residual (8–9 mV rms) is no worse than polling's. Carried forward with the single-sample outliers from Step 9; DMA mode will be a third data point.
+
+### Step 12 summary
+
+**Step 12 replaces the polling loop with two interrupts: TIM1's tick starts each conversion and the ADC's end-of-conversion collects it. On an idle CPU the lateness spread drops from 10–14 cycles to 4. Under the 1 kHz load, giving acquisition the higher priority removes the 2.5 µs late samples entirely.**
+
+**What changed:**
+1. **`startup.c`:** the vector table grows to all 91 STM32F429 interrupts, with `ADC_IRQHandler` at entry 16 + 18 and `TIM1_CC_IRQHandler` at 16 + 27.
+2. **`TIM1_CC_IRQHandler`** reads `TIM1_CNT`, clears CC1IF and sets SWSTART. **`ADC_IRQHandler`** stores DR. The burst state lives in `volatile` globals.
+3. **NVIC:** both interrupts enabled in `NVIC_ISER0`, and priorities set with `ACQ_PRIO` and `SYSTICK_PRIO`.
+4. **`main()`** starts a burst by enabling CC1IE and EOCIE, then just waits for `n_done` to reach 1,000.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| `LOAD 0` spread | a few cycles, at most 10–14 | 4 cycles (23–27) |
+| `LOAD 0` `n_late` / `missed` | 0 / 0 | 0 / 0 |
+| SysTick first, worst lateness | about 2.5 µs | 2.50 µs (360 cycles), 7 of 30 lines |
+| Acquisition first, `n_late` | 0 on every line | 0; `late_max` 27 on every line |
+| Acquisition first, `systicks` | 1000, sometimes 999 | 1000, twice 999 |
+| `missed` | 0 | 0 in all three |
+| Frequency | 2 kHz ± 0.1% | 1999.9–2000.1 Hz |
+| Peak-to-peak / offset | as Step 10 | 1983–1989 mV / 1638–1640 mV |
+
+**Lateness so far, at 100 kHz:**
+
+| Mode | Idle spread | Worst with the 1 kHz, 2 µs load |
+|---|---|---|
+| Polling (Step 11) | 10–14 cycles (0.1 µs) | 366 cycles (2.54 µs) |
+| Interrupts, SysTick first | 4 cycles (28 ns) | 360 cycles (2.50 µs) |
+| Interrupts, acquisition first | 4 cycles (28 ns) | 8 cycles (56 ns) |
+
+**What you learned along the way:**
+- **An interrupt needs three switches:** the peripheral's enable bit (CC1IE, EOCIE), the NVIC's enable bit, and a handler in the vector table under the exact name `startup.c` uses.
+- **Priority decides jitter.** Moving acquisition from below SysTick to above it took the worst lateness from 2.50 µs to 56 ns, with no other code change. Polling can't do that, because a polling loop can never interrupt an interrupt.
+- **Clear the interrupt flag first thing in the handler.** Otherwise the interrupt fires again as soon as the handler returns.
+- **Change one thing at a time to find a cause.** Swapping the LA, the firmware and the load one by one tied the 400–500 Hz wave to interrupt mode, and ruled out the wiring.
