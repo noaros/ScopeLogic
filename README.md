@@ -1972,3 +1972,150 @@ So the sample clock's period varies by **about 4–5 ns peak to peak** over 10 �
 - **Each DMA request has fixed streams and channels.** ADC1 is on DMA2 stream 0 or 4, channel 0 (RM0090 Table 43).
 - **Check the instrument against itself.** The band at D = 0 showed the scope's own error (about 1 ns) before blaming the 4.76 ns at D = 10 µs on the board.
 - **The clock sets a limit that software can't measure.** `TIM1_CNT` counts the same clock it would be measuring against, so the 5 ns of clock jitter only showed up on the scope.
+
+
+## Step 14 — All three modes behind one switch, and CPU load
+
+**Goal:** put polling, interrupts and DMA in one firmware, picked by `#define MODE`, and measure the **CPU load** of each: the share of the CPU that acquisition uses at 100 kHz. Lateness already showed *how well* each mode samples. CPU load shows *what it costs*.
+
+**How to measure CPU load: count what's left over.** During the burst, `main()` runs a loop that does nothing but count its own passes for a fixed time, the **window**: the whole burst plus 2 sample periods. Every cycle an interrupt takes is a cycle that loop doesn't run. Just before each burst, the same loop runs for the same window with no acquisition: that's `idle_base`. Then
+
+  load = 1 − `idle` / `idle_base`
+
+Interrupt entry and exit are counted too, because they take cycles away from the loop just like the handler code does. GPIO markers (a pin high during a handler) would miss those. SysTick runs during both windows, so its share cancels out.
+
+- **Polling:** the CPU never leaves its loop during the burst, so `idle` = 0 and the load is **100%** by definition.
+- **Interrupts:** the counting loop runs while the two handlers do the sampling.
+- **DMA:** the counting loop runs while the hardware does the sampling. The DMA only takes bus cycles, and only on the bus it uses: the loop's variables live on the stack, at the top of RAM (SRAM3), and `samples[]` is at the bottom (SRAM1). The bus matrix connects the CPU and the DMA to different RAM blocks at the same time, so they shouldn't get in each other's way.
+
+The load is sent as an integer in units of 0.01%: `load=1250` means 12.50%. It's clamped at 0: with almost no load, `idle` can come out a little above `idle_base` just from where SysTick happens to land.
+
+All three runs use **acquisition first** (`ACQ_PRIO 0u`, `SYSTICK_PRIO 1u`), the realistic setting from Step 12, at the light load (`LOAD_CYCLES 288u`). For DMA the priorities make no difference.
+
+The open item from Steps 12 and 13 gets a check too: only one polling run has been tested for the 400–500 Hz wave so far, so `burst.py` now prints the biggest peaks in the residual's spectrum.
+
+1. **Wiring.** No change from Step 13. The scope isn't needed.
+2. **Change `firmware/main.c`.**
+
+   Above `#define LOAD 1`, add:
+   ```c
+   #define MODE 3                                          /* 1 = polling, 2 = interrupts, 3 = DMA */
+   #define WINDOW ((NSAMP + 2u) * PERIOD)                  /* idle-count window: the whole burst plus 2 periods */
+   ```
+   Set `ACQ_PRIO` to `0u` and `SYSTICK_PRIO` to `1u`.
+
+   Above `/* Every TIM1 tick: start one conversion */`, add the counting loop:
+   ```c
+   /* Count loop passes for a fixed number of cycles. Any cycle an interrupt or the DMA
+      takes away is a cycle this loop doesn't run, so fewer passes = more CPU used elsewhere */
+   static uint32_t idle_loop(uint32_t cycles)
+   {
+       uint32_t n = 0, t0 = DWT_CYCCNT;
+       while (DWT_CYCCNT - t0 < cycles) n++;
+       return n;
+   }
+   ```
+   In the once-a-second block, replace everything from `DMA2_LIFCR  = 0x3Du;` up to (not including) `uint32_t vref = adc_read(17);` with:
+   ```c
+               uint32_t idle_base = idle_loop(WINDOW);     /* the same window with no acquisition running */
+               uint32_t idle = 0;                          /* polling never leaves its loop: no idle time */
+               missed = 0; late_min = PERIOD; late_max = 0; n_late = 0;
+   #if MODE == 1
+               TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+               for (uint32_t i = 0; i < NSAMP; i++) {
+                   while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
+                   TIM1_SR = ~(1u << 1);                   /* clear it */
+                   uint32_t cnt = TIM1_CNT;                /* where the timer is now */
+                   samples[i] = (uint16_t)adc_read(3);
+                   uint32_t late = (cnt + PERIOD - PERIOD / 2) % PERIOD;  /* cycles since CNT passed CCR1 */
+                   if (late < late_min) late_min = late;
+                   if (late > late_max) late_max = late;
+                   if (late > LATE_LIMIT) n_late++;
+                   if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
+               }
+   #elif MODE == 2
+               n_started = 0; n_done = 0;
+               ADC1_SQR3 = 3;                              /* A0 for the whole burst */
+               ADC1_CR1 |= 1u << 5;                        /* EOCIE: interrupt at the end of each conversion */
+               TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+               TIM1_DIER |= 1u << 1;                       /* CC1IE: interrupt on every tick from now on */
+               idle = idle_loop(WINDOW);                   /* the burst runs in the interrupts meanwhile */
+               while (n_done < NSAMP) {}                   /* already done: the window is longer than the burst */
+   #else
+               DMA2_LIFCR  = 0x3Du;                        /* clear stream 0's flags from the last burst */
+               DMA2_S0NDTR = NSAMP;                        /* move 1,000 results */
+               DMA2_S0PAR  = (uint32_t)&ADC1_DR;           /* from the ADC's data register */
+               DMA2_S0M0AR = (uint32_t)samples;            /* to samples[] */
+               DMA2_S0CR   = (1u << 13) | (1u << 11) | (1u << 10);  /* channel 0 (ADC1), 16 bits each side, step the memory address */
+               DMA2_S0CR  |= 1u << 0;                      /* EN: stream on, waiting for requests */
+               ADC1_SQR3   = 3;                            /* A0 */
+               ADC1_SR     = 0;                            /* clear EOC and OVR */
+               ADC1_CR2   |= 1u << 8;                      /* DMA: a request after every conversion */
+               ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising */
+               idle = idle_loop(WINDOW);                   /* the burst runs in hardware meanwhile */
+               uint32_t t_start = DWT_CYCCNT;
+               while (!(DMA2_LISR & (1u << 5))             /* TCIF0: should already be set */
+                      && DWT_CYCCNT - t_start < NSAMP * PERIOD) {}
+               ADC1_CR2   &= ~((3u << 28) | (1u << 8));    /* trigger off, DMA off */
+               uint32_t ndtr = DMA2_S0NDTR;                /* results not moved: 0 if the burst completed */
+               uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0 */
+               DMA2_S0CR  &= ~(1u << 0);                   /* stream off */
+               uint32_t t1 = DWT_CYCCNT;
+               while (DWT_CYCCNT - t1 < 300u) {}           /* let a conversion the timer already started finish */
+               (void)ADC1_DR;
+               ADC1_SR = 0;                                /* so adc_read(17) waits for its own EOC */
+   #endif
+               uint32_t load = 0;                          /* CPU load in 0.01 %: 1250 = 12.50 % */
+               if (idle < idle_base) load = 10000u - idle * 10000u / idle_base;  /* idle stays under 400,000, so this fits in 32 bits */
+   ```
+   In the line, replace everything from `uart_field(" burst=", ...)` up to (not including) `uint32_t now_systicks = systicks;` with:
+   ```c
+               uart_field(" mode=",    MODE);
+               uart_field(" idle_base=", idle_base);
+               uart_field(" idle=",    idle);
+               uart_field(" load=",    load);
+   #if MODE == 3
+               uart_field(" ndtr=",    ndtr);
+               uart_field(" dma_err=", dma_err);
+   #else
+               uart_field(" missed=",  missed);
+               uart_field(" late_min=", late_min);
+               uart_field(" late_max=", late_max);
+               uart_field(" n_late=",   n_late);
+   #endif
+   ```
+   Notes:
+   - **Polling (MODE 1)** is the Step 11 loop, now writing the `volatile` globals from Step 12 so all modes report the same fields. It no longer records `span`.
+   - **Interrupts (MODE 2)** is Step 12's code, with `idle_loop()` in place of the plain wait. The window is longer than the burst, so by the time it ends the burst is complete.
+   - **DMA (MODE 3)** is Step 13's code, with `idle_loop()` in place of the wait for TCIF0. That wait now only checks the flag, which should already be set.
+   - The window is 1,002 × 1,440 = 1,442,880 cycles, and each pass of `idle_loop()` is 10 instructions, so `idle_base` should be about **120,000**.
+3. **Change `analysis/burst.py`.** Add `"mode"` and `"load"` to the list of fields it prints:
+   ```python
+           extra = ", ".join(f"{k} {header[k]}" for k in ("mode", "load", "span", "missed", "burst", "ndtr", "dma_err") if k in header)
+   ```
+   and print the residual's three biggest spectrum peaks. After the `print(f"residual: ...")` line, add:
+   ```python
+           spec = np.abs(np.fft.rfft(resid * np.hanning(len(resid))))
+           freqs = np.fft.rfftfreq(len(resid), dt)
+           top = np.argsort(spec[1:])[::-1][:3] + 1        # skip 0 Hz
+           print("residual peaks: " + ", ".join(f"{freqs[i]:.0f} Hz" for i in top))
+   ```
+   Each bin is 1 / 10 ms = 100 Hz wide.
+4. For each of **`MODE 1`, `2` and `3`**: from `firmware/`, `make`, `make flash`, then watch about 30 s of lines:
+   `stty -F /dev/ttyACM0 115200 raw -echo; grep -a --line-buffered '^t=' /dev/ttyACM0`
+   Then from the repo root run `python3 analysis/burst.py` three times. End with `MODE 3`.
+
+Predictions:
+- **`idle_base`** about 120,000, the same in all three modes, and steady to within about 0.1% from line to line. One SysTick more or less in the window is about 320 cycles, 0.02%.
+- **Polling:** `load=10000` (100%). Lateness as in Step 11 with acquisition first: `late_max` up to about 2.5 µs on some lines. A higher priority can't help polling, because the polling loop isn't an interrupt.
+- **Interrupts:** `load` about **1000–1500** (10–15%). The tick handler is 90 instructions (with a division and several peripheral reads) and the ADC handler 27. Add about 12 cycles to enter and about 10 to leave each one, and it comes to about 150–200 cycles of every 1,440. `late_max` 27 on every line, as in Step 12.
+- **DMA:** `load` about **0**, within a few hundredths of a percent. `ndtr=0`, `dma_err=0`.
+- **`burst.py`** passes in all three modes: frequency within 0.1% of 2 kHz, amplitude and offset as in Step 13. Note whether 400 or 500 Hz is among the residual peaks in each mode.
+
+**Done when:**
+- In each mode, every line shows the expected checks: polling `missed=0`; interrupts `missed=0` and `n_late=0`; DMA `ndtr=0` and `dma_err=0`.
+- `idle_base` matches across the three modes, within about 0.1%.
+- `load` is 10000 for polling, a steady value for interrupts, and about 0 for DMA.
+- `burst.py` passes in all three modes.
+
+Write down `idle_base`, `idle` and `load` for each mode, `late_max` for polling and interrupts, and the residual peaks in each mode.
