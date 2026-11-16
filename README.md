@@ -1,6 +1,8 @@
 # ScopeLogic
 
-> Benchmarked polling, interrupt, and DMA-based ADC acquisition in bare-metal C on an STM32F429 (register-level, no HAL); using logic-analyzer GPIO instrumentation and oscilloscope timing measurements, showed DMA cut CPU load from **[A]%** to **[B]%**, reduced sampling jitter from **[C] µs** to **<[D] ns**, and raised max sustained sample rate **[E]×** to **[X] MSPS**.
+> Benchmarked polling, interrupt, and DMA-based ADC acquisition in bare-metal C on an STM32F429 (register-level, no HAL); using logic-analyzer GPIO instrumentation and oscilloscope timing measurements, showed DMA cut CPU load from **100%** to **0%**, reduced sampling jitter from **2.5 µs** to **<5 ns**, and raised max sustained sample rate **4×** to **2.4 MSPS**.
+
+Measured with a 1 kHz, 2 µs background interrupt running. CPU load (at 100 kHz) and jitter compare polling with DMA. The rate compares DMA with interrupts: 600 kHz to 2.4 MHz, the ADC's own limit (12× over polling). Jitter for DMA is the sample clock's own, measured on the scope. Details in the Step 11–15 summaries.
 
 ## Step 1 — Confirm the toolchain can talk to the board
 
