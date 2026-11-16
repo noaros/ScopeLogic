@@ -33,6 +33,20 @@
 #define ADC1_DR     (*(volatile uint32_t *)0x4001204C)
 #define ADC_CCR     (*(volatile uint32_t *)0x40012304)
 #define VREFINT_CAL (*(volatile uint16_t *)0x1FFF7A2A)  /* factory reading of VREFINT at 3.3 V, 30 C */
+#define GPIOE_MODER   (*(volatile uint32_t *)0x40021000)
+#define GPIOE_OSPEEDR (*(volatile uint32_t *)0x40021008)
+#define GPIOE_AFRH    (*(volatile uint32_t *)0x40021024)
+#define TIM1_CR1    (*(volatile uint32_t *)0x40010000)
+#define TIM1_SR     (*(volatile uint32_t *)0x40010010)
+#define TIM1_EGR    (*(volatile uint32_t *)0x40010014)
+#define TIM1_CCMR1  (*(volatile uint32_t *)0x40010018)
+#define TIM1_CCER   (*(volatile uint32_t *)0x40010020)
+#define TIM1_PSC    (*(volatile uint32_t *)0x40010028)
+#define TIM1_ARR    (*(volatile uint32_t *)0x4001002C)
+#define TIM1_CCR1   (*(volatile uint32_t *)0x40010034)
+#define TIM1_BDTR   (*(volatile uint32_t *)0x40010044)
+
+#define FS 100000u                                      /* sample rate in Hz: must divide 144 MHz exactly */
 
 /* Globals: the startup code sets these up before main() runs */
 uint32_t period = 1440;                                 /* .data: 1440 cycles at 144 MHz = 10 us */
@@ -79,7 +93,7 @@ static uint32_t adc_read(uint32_t channel)
 
 int main(void)
 {
-    RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5);  /* GPIOA, B, C, D, F clocks */
+    RCC_AHB1ENR |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5);  /* GPIOA-F clocks */
     (void)RCC_AHB1ENR;
 
     /* MCO2 = SYSCLK / 5 on PC9 (set the divider before the pin starts outputting) */
@@ -138,6 +152,21 @@ int main(void)
     uint32_t t0 = DWT_CYCCNT;
     while (DWT_CYCCNT - t0 < 20u * 144u) {}             /* wait 20 us for the ADC and VREFINT to settle */
 
+    /* TIM1: the sample clock. Counts 144 MHz ticks from 0 to ARR, over and over */
+    RCC_APB2ENR |= 1u << 0;                             /* TIM1 clock: APB2 is 72 MHz, so timers get 2 x 72 = 144 MHz */
+    (void)RCC_APB2ENR;
+    GPIOE_AFRH    = (GPIOE_AFRH & ~(0xFu << 4)) | (1u << 4);       /* PE9 alternate function 1 = TIM1_CH1 */
+    GPIOE_OSPEEDR |= 3u << 18;                          /* PE9 very high speed: sharp edges for timing */
+    GPIOE_MODER   = (GPIOE_MODER & ~(3u << 18)) | (2u << 18);      /* PE9 = alternate function */
+    TIM1_PSC   = 0;                                     /* count every 144 MHz tick */
+    TIM1_ARR   = 144000000u / FS - 1;                   /* 1440 ticks per period at 100 kHz: count 0..1439 */
+    TIM1_CCR1  = (144000000u / FS) / 2;                 /* compare at the middle: 50% duty */
+    TIM1_CCMR1 = (7u << 4) | (1u << 3);                 /* OC1M = PWM mode 2: PE9 goes high when CNT reaches CCR1; OC1PE */
+    TIM1_CCER  = 1u << 0;                               /* CC1E: drive the pin */
+    TIM1_BDTR  = 1u << 15;                              /* MOE: TIM1 is an "advanced" timer, its outputs stay off without this */
+    TIM1_EGR   = 1u << 0;                               /* UG: load PSC, ARR and CCR1 now */
+    TIM1_CR1   = 1u << 0;                               /* CEN: start counting */
+
     uint32_t next = DWT_CYCCNT;
     for (;;) {
         next += period;                                 /* next deadline, from the last one, not from now */
@@ -146,10 +175,17 @@ int main(void)
         toggles++;
 
         if (toggles % 100000u == 0) {                   /* once a second */
-            uint32_t c0 = DWT_CYCCNT;
-            for (uint32_t i = 0; i < NSAMP; i++)
-                samples[i] = (uint16_t)adc_read(3);     /* back to back: no gaps between conversions */
-            uint32_t burst = DWT_CYCCNT - c0;           /* cycles for the whole burst */
+            uint32_t missed = 0, first = 0, last = 0;
+            TIM1_SR = ~(1u << 1);                       /* clear CC1IF: ignore ticks from before the burst */
+            for (uint32_t i = 0; i < NSAMP; i++) {
+                while (!(TIM1_SR & (1u << 1))) {}       /* wait for CC1IF: the next sample time */
+                TIM1_SR = ~(1u << 1);                   /* clear it (writing 0 clears a flag, writing 1 leaves it alone) */
+                last = DWT_CYCCNT;
+                if (i == 0) first = last;
+                samples[i] = (uint16_t)adc_read(3);
+                if (TIM1_SR & (1u << 1)) missed++;      /* the next tick came before this sample finished */
+            }
+            uint32_t span = last - first;               /* cycles from the first sample's start to the last's */
             uint32_t vref = adc_read(17);
             uint32_t vdda_mV = vref ? 3300u * VREFINT_CAL / vref : 0;
 
@@ -161,7 +197,9 @@ int main(void)
 
             uart_field("t=",        toggles / 100000u);
             uart_field(" vdda_mV=", vdda_mV);
-            uart_field(" burst=",   burst);
+            uart_field(" fs=",      FS);
+            uart_field(" span=",    span);
+            uart_field(" missed=",  missed);
             uart_field(" min=",     lo);
             uart_field(" max=",     hi);
             uart_puts("\r\n");

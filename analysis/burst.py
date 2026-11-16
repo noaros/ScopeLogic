@@ -55,13 +55,18 @@ def main():
 
     header, s = read_burst(args.port)
     vdda = int(header["vdda_mV"])
-    burst = int(header["burst"])
-    dt = burst / len(s) / CPU_HZ
+    if "fs" in header:                              # Step 10 on: samples paced by TIM1
+        dt = 1 / int(header["fs"])
+        print(f"burst: {len(s)} samples at {int(header['fs']) / 1e3:g} kHz ({dt * 1e6:.3f} us apart), "
+              f"span {header['span']} cycles, missed {header['missed']}, VDDA {vdda} mV")
+    else:                                           # Step 9: back to back, spacing from the burst time
+        burst = int(header["burst"])
+        dt = burst / len(s) / CPU_HZ
+        print(f"burst: {len(s)} samples in {burst} cycles = {burst / CPU_HZ * 1e3:.3f} ms, "
+              f"{dt * 1e6:.3f} us apart ({1 / dt / 1e3:.1f} kHz), VDDA {vdda} mV")
     mv = s * vdda / 4095
     t = np.arange(len(s)) * dt
 
-    print(f"burst: {len(s)} samples in {burst} cycles = {burst / CPU_HZ * 1e3:.3f} ms, "
-          f"{dt * 1e6:.3f} us apart ({1 / dt / 1e3:.1f} kHz), VDDA {vdda} mV")
     print(f"min {mv.min():.0f} mV, max {mv.max():.0f} mV, mean {mv.mean():.0f} mV")
 
     fit = None

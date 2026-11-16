@@ -1377,3 +1377,50 @@ Later steps reuse this timer: a background interrupt load comes next, then the t
 - The plot shows 20 clean cycles of the sine.
 
 Write down the CH2 frequency and duty, the range of `span`, `missed`, and the script's frequency, amplitude, offset and residual. Save the plot.
+
+**Measured:**
+
+Scope, CH2 on PE9 with the clip line (1X), H = 10 µs/div. All Measure read **96.15 kHz** and **+Duty 46.15%**. The cursors disagreed: across 10 periods, rising edge to rising edge, ΔX = **100.2 µs** (10.02 µs per period, 99.8 kHz). Rising edge to the next falling edge, ΔX = **5.0 µs** (50%). The 0.2 µs left over is about one cursor step at 10 µs/div. The register values fix the period at exactly 1,440 cycles and CCR1 at half of it, and the board's `span` confirms that, so the cursor readings are right and the automatic measurement is wrong on this signal. The automatic readings, 10.4 µs period and 4.8 µs high, are both whole multiples of 0.4 µs. That suggests the scope measures from a coarse copy of the waveform rather than the full 1 GSa/s data. The clip line's ringing edges may add to the error.
+
+Board, generator on A0 as in Step 9. Three runs of `analysis/burst.py`:
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| `span` (cycles) | 1,438,550 | 1,438,562 | 1,438,562 |
+| `missed` | 0 | 0 | 0 |
+| Frequency | 1999.9 Hz | 2000.1 Hz | 1999.8 Hz |
+| Fitted peak-to-peak | 1986 mV | 1985 mV | 1985 mV |
+| Fitted offset | 1646 mV | 1644 mV | 1643 mV |
+| Residual rms / worst | 10.1 / 53 mV | 9.9 / 48 mV | 9.8 / 51 mV |
+
+- `span` takes only two values, **1,438,562** (most lines) and **1,438,550**: 2 and 10 cycles from the prediction. The 12-cycle gap is one trip round the wait loop: the loop notices the flag on whichever pass comes first after the tick, so the first and last samples can each land one pass later.
+- `missed` is 0 on every line, and the frequency is within 0.01% of 2 kHz. Peak-to-peak and offset match Step 9.
+- The residual is down from 14–16 mV rms to **about 10 mV**. In earlier bursts only **13–22 of 1,000 samples** were off by more than 30 mV, against 49–67 in Step 9, and the worst is about 50 mV instead of 80–90. Without them the spread is about 8 mV rms. The open item from Step 9 is smaller, but it hasn't gone away.
+
+![A0 burst paced by TIM1: 20 cycles of the 2 kHz sine with the fitted sine, and the residual below](docs/step10-sine.png)
+
+### Step 10 summary
+
+**Step 10 paces each ADC reading with TIM1 at exactly 100 kHz. The first and last samples are always 999 × 1,440 cycles apart, give or take one pass of the wait loop, no matter how fast the code runs.**
+
+**What changed:**
+1. **TIM1** counts the 144 MHz timer clock from 0 to 1439 and sets CC1IF halfway through each period. PWM mode 2 drives **PE9 (D6)** high at that same moment, so the sample clock can be seen on a pin.
+2. **The burst** waits for CC1IF before each reading. It counts a missed tick if the next one arrived before the reading finished, and reports `fs`, `span` and `missed` instead of `burst`.
+3. **`analysis/burst.py`** takes the sample spacing from `fs` when the board sends it.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| PE9 frequency | 100.000 kHz | 100.2 µs for 10 periods (cursors); All Measure 96.15 kHz |
+| PE9 duty | 50% | 5.0 µs high (cursors); All Measure 46.15% |
+| `span` | 1,438,560 ± 10 | 1,438,550 or 1,438,562 |
+| `missed` | 0 | 0 |
+| Frequency | 2 kHz ± 0.1% | 1999.8–2000.1 Hz |
+| Peak-to-peak / offset | as Step 9 | 1985–1986 mV / 1643–1646 mV |
+| Residual | | about 10 mV rms, worst about 50 mV |
+
+**What you learned along the way:**
+- **Check the scope's automatic measurements with the cursors.** On a fast square wave seen through a clip line, All Measure was 4% off, while cursors across 10 periods agreed with the board to 0.2%. Measuring across many periods makes any error in where you place the cursors that many times smaller.
+- **Time cursors and voltage cursors are different lines.** AX/BX are vertical lines that measure time, and AY/BY are horizontal lines that measure voltage.
+- **A hardware timer sets when each sample is taken, not how fast the code runs.** The only timing error left is the wait loop's granularity, about 12 cycles (83 ns), and `missed` shows when the code can't keep up.
