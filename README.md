@@ -2428,3 +2428,136 @@ Filling in the README's opening bullet from these: DMA cut CPU load from **100%*
 - **Find the limit by pushing past it.** Each sweep went one rate above the expected maximum, so the table shows both sides of the edge.
 - **CPU modes get worse with load, and DMA doesn't.** Polling's limit was set by SysTick, not by its own speed. Interrupts were fine until their own handlers filled the period. DMA stopped only at the ADC's conversion time.
 - **Short sampling times are fine for a strong source that changes slowly.** The capacitor starts from the previous sample, so it only has to settle the difference.
+
+
+## Step 16 — Does the CPU cause the 400–500 Hz wave?
+
+**Goal:** test the explanation from Step 14 for the slow wave in the residual. So far it shows up with interrupts and DMA, but never with polling. The idea: in polling, the CPU does exactly the same thing at every sample instant. In the other modes it runs a loop at its own pace, so what it's doing when the ADC samples drifts slowly from sample to sample. The CPU's switching noise reaches the ADC, so a slow drift could show up as a slow wave.
+
+**The test: put the CPU to sleep during a DMA burst.** `WFI` (wait for interrupt) stops the CPU's clock until an interrupt arrives, while the peripherals keep running. The timer, ADC and DMA then take all 1,000 samples while the CPU does nothing at all. DMA2's transfer-complete interrupt wakes it at the end. If the wave comes from the CPU's loop, it should go away.
+
+Four runs, in this order, with **no background load** (`LOAD=0`), so SysTick can't wake the CPU or add activity of its own:
+
+| Run | Build | The CPU during the burst |
+|---|---|---|
+| A | `MODE=1 LOAD=0` | Polling: the same loop, locked to the ticks |
+| B | `MODE=3 LOAD=0 WAIT=0` | DMA, running `idle_loop()` at its own pace |
+| C | `MODE=3 LOAD=0 WAIT=1` | DMA, asleep |
+| A again | `MODE=1 LOAD=0` | Polling again, to check nothing else changed during the test |
+
+To compare runs, `burst.py` now also reports **the residual's rms in the 300–600 Hz band**: the size of the wave, in mV.
+
+**Sleeping safely.** The obvious version, `while (!dma_done) wfi;`, has a race. If the interrupt arrives just after the check and just before `WFI`, the CPU sleeps waiting for an interrupt that has already come and gone. With no SysTick running, nothing would ever wake it. The usual fix:
+1. Hold interrupts off with `cpsid i` (it sets PRIMASK).
+2. Check the flag.
+3. `WFI`. A *pending* interrupt still wakes the CPU even while PRIMASK holds it off, so one that arrived after the check isn't missed.
+4. `cpsie i` lets it run, then `cpsid i` again before the next check.
+
+1. **Wiring.** Generator on A0 as before. **Set the generator back to 2 kHz**, 2 Vpp, 1.65 V offset, if it's still at 48 kHz from Step 15.
+2. **Change `firmware/Makefile`.** Let `LOAD` and `WAIT` come from the command line too. Replace the `DEFS` line and its comment with:
+   ```make
+   # make MODE=2 FS=500000 LOAD=0 WAIT=1 builds with those instead of the values in main.c
+   DEFS    = $(if $(MODE),-DMODE=$(MODE)) $(if $(FS),-DFS=$(FS)u) $(if $(LOAD),-DLOAD=$(LOAD)) $(if $(WAIT),-DDMA_WAIT=$(WAIT))
+   ```
+3. **Change `firmware/startup.c`.** Add a weak handler after `TIM1_CC_IRQHandler`'s:
+   ```c
+   void DMA2_Stream0_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
+   ```
+   and its vector table entry after `[16 + 27] = TIM1_CC_IRQHandler,`:
+   ```c
+       [16 + 56] = DMA2_Stream0_IRQHandler,
+   ```
+4. **Change `firmware/main.c`.**
+
+   Replace the `#define LOAD 1` line with:
+   ```c
+   #ifndef LOAD                                            /* make LOAD=0 overrides this */
+   #define LOAD 1                                          /* 1: background SysTick load on, 0: off */
+   #endif
+   #ifndef DMA_WAIT                                        /* make WAIT=1 overrides this */
+   #define DMA_WAIT 0                                      /* MODE 3 only. 0: count idle passes, 1: sleep (WFI) until the DMA is done */
+   #endif
+   ```
+   After `#define TIM1_CC_IRQ 27`, add:
+   ```c
+   #define DMA2_S0_IRQ 56
+   #define NVIC_ISER1  (*(volatile uint32_t *)0xE000E104)  /* enable bits for interrupts 32-63 */
+   ```
+   Above `/* Every finished conversion: collect the result */`, add the handler:
+   ```c
+   /* DMA2 stream 0 finished all 1,000 transfers (only enabled with DMA_WAIT 1) */
+   volatile uint32_t dma_done;
+   void DMA2_Stream0_IRQHandler(void)
+   {
+       DMA2_LIFCR = 1u << 5;                               /* clear TCIF0, or the interrupt comes straight back */
+       dma_done = 1;
+   }
+   ```
+   After the `NVIC_ISER0 = ...` line, enable it:
+   ```c
+       NVIC_IPR(DMA2_S0_IRQ) = ACQ_PRIO << 4;
+       NVIC_ISER1 = 1u << (DMA2_S0_IRQ - 32);              /* interrupt 56 is bit 24 of the second enable register */
+   ```
+   In the DMA branch, replace the `DMA2_S0CR = ...` line with:
+   ```c
+               DMA2_S0CR   = (1u << 13) | (1u << 11) | (1u << 10)   /* channel 0 (ADC1), 16 bits each side, step the memory address */
+                           | (DMA_WAIT ? 1u << 4 : 0u);    /* TCIE: interrupt when all are done, to wake the CPU */
+               dma_done = 0;
+   ```
+   and replace from `idle = idle_loop(WINDOW);` through the `while (!(DMA2_LISR & (1u << 5)) ...` wait with:
+   ```c
+   #if DMA_WAIT
+               /* Sleep until the DMA's interrupt. Interrupts are held off (PRIMASK) around the check, so the
+                  interrupt can't slip in between "not done yet" and the WFI. A pending interrupt still wakes
+                  the CPU from WFI while PRIMASK is set; it then runs as soon as cpsie lets it */
+               __asm volatile ("cpsid i" ::: "memory");
+               while (!dma_done) {
+                   __asm volatile ("wfi");
+                   __asm volatile ("cpsie i\n\tisb\n\tcpsid i" ::: "memory");
+               }
+               __asm volatile ("cpsie i" ::: "memory");
+               uint32_t ndtr = DMA2_S0NDTR;                /* 0: all 1,000 moved */
+   #else
+               idle = idle_loop(WINDOW);                   /* the burst runs in hardware meanwhile */
+               uint32_t ndtr = DMA2_S0NDTR;                /* results still to come: 0 unless a trigger was skipped */
+               uint32_t t_start = DWT_CYCCNT;
+               while (!(DMA2_LISR & (1u << 5))             /* TCIF0: should already be set */
+                      && DWT_CYCCNT - t_start < NSAMP * PERIOD) {}
+   #endif
+   ```
+   An asleep CPU counts nothing, so there's no load figure in that case. Replace `uart_field(" load=",    load);` with:
+   ```c
+   #if !(MODE == 3 && DMA_WAIT)                            /* asleep, the CPU counts nothing: no load figure */
+               uart_field(" load=",    load);
+   #else
+               (void)load;
+               uart_field(" wfi=",     1);
+   #endif
+   ```
+   Notes:
+   - `cpsid i`, `wfi` and `cpsie i` are single instructions with no C equivalent, so they're written as inline assembly. `"memory"` tells the compiler not to move reads of `dma_done` across them. `isb` makes sure `cpsie` has taken effect before `cpsid` turns interrupts off again.
+   - Interrupt 56 is beyond the first 32, so its enable bit is in `NVIC_ISER1`. The vector table entry is 16 + 56 = 72.
+5. **Change `analysis/burst.py`.** After the `print("residual peaks: ...")` line, add:
+   ```python
+           x = np.fft.rfft(resid)                          # no window: the bins' power adds up to the rms
+           band = (freqs >= 300) & (freqs <= 600)
+           band_rms = np.sqrt(2 * np.sum(np.abs(x[band]) ** 2)) / len(resid)
+           print(f"residual 300-600 Hz: {band_rms:.1f} mV rms")
+   ```
+   By Parseval's theorem, a signal's power equals the sum of its spectrum bins' power, so adding up the 300–600 Hz bins gives the rms of just that part of the residual. On a test signal, 7 mV rms at 450 Hz buried in 3 mV of noise reads 6.7 mV.
+6. **Run A, B, C and A again.** For each: from `firmware/`, `make flash` with that run's settings. Then from the repo root, run `python3 analysis/burst.py` **five times** and note the 300–600 Hz rms and the top peaks. Save one plot of run C: `python3 analysis/burst.py --plot docs/step16-wfi.png`.
+7. Afterwards, `make flash` with no arguments to go back to MODE 3, `LOAD 1`, `DMA_WAIT 0`.
+
+Predictions:
+- **A (polling):** 300–600 Hz rms about **1–2 mV**: no wave, only the noise that falls in those bins. Top peaks elsewhere, as in Step 14.
+- **B (DMA, idle loop):** about **5–8 mV**, with 400 and 500 Hz on top, as in Steps 13–15. Steps 13–15 always had SysTick on; this shows the wave doesn't need it.
+- **C (DMA, asleep):** if the explanation is right, about the same as A. If it's about the same as B, the CPU's loop isn't the cause, and the next thing to look at is what else polling does differently. For example, it writes `ADC1_SQR3` and starts every conversion itself.
+- **A again:** about the same as the first A.
+- `ndtr=0` in B and C; frequency, peak-to-peak and offset as in Step 15's 100 kHz check, in all four runs.
+
+**Done when:**
+- All four runs pass the usual sine checks: frequency within 0.1% of 2 kHz, peak-to-peak and offset as in Step 15.
+- The two A runs agree with each other, and B shows the wave.
+- You can say whether sleeping removes the wave (C close to A) or not (C close to B).
+
+Write down the five 300–600 Hz values for each run, and the top peaks.
