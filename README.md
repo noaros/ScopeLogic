@@ -2561,3 +2561,49 @@ Predictions:
 - You can say whether sleeping removes the wave (C close to A) or not (C close to B).
 
 Write down the five 300–600 Hz values for each run, and the top peaks.
+
+**Measured** (2 kHz sine, 100 kHz, A0 at 3 sampling cycles, five bursts per run, in this order):
+
+| Run | Build | 300–600 Hz rms | Top two peaks | Frequency | Peak-to-peak |
+|---|---|---|---|---|---|
+| A | `MODE=1 LOAD=0` | 4.7–5.2 mV | 400, 500 Hz in all 5 | 1999.8–2000.0 Hz | 1984–1989 mV |
+| B | `MODE=3 LOAD=0 WAIT=0` | 4.6–5.0 mV | 400, 500 Hz in all 5 | 2000.1 Hz | 1985–1989 mV |
+| C | `MODE=3 LOAD=0 WAIT=1` | 4.6–5.3 mV | 400, 500 Hz in all 5 | 1999.8–2000.1 Hz | 1982–1987 mV |
+| A again | `MODE=1 LOAD=0` | 4.9–5.2 mV | 400, 500 Hz in all 5 | 1999.9–2000.2 Hz | 1985–1992 mV |
+| Extra | `MODE=1 LOAD=1` | 1.1–3.3 mV | 700–800 Hz in 4 of 5 | 2000.0–2000.2 Hz | 1986–1988 mV |
+
+`ndtr=0` in B and C. Offsets 1643–1650 mV throughout.
+
+- **Sleeping the CPU changes nothing.** C matches B, so the CPU's own activity during the burst is not the cause. **The explanation from Step 14 is wrong.**
+- **Polling has the wave too, when the load is off.** A and A again match B and C, so the wave doesn't follow the mode either.
+- **The extra run explains the earlier "polling is clean" results.** Every earlier polling run had `LOAD 1`. With it, polling's 300–600 Hz content is smaller (1.1–3.3 mV) and the low-frequency peaks move to 700–800 Hz. Steps 12–14 also only ranked peaks, and ranking can't show how big a component is. With SysTick on, polling also had a strong component near 49 kHz that topped the list. Why polling plus SysTick moves the low-frequency content is still unexplained: SysTick only delays about 10 samples in some bursts, and a delay like that would add spikes, not shift a smooth wave.
+- **Size:** about 5 mV rms, roughly ±7 mV, or about 6 LSB. That's under 0.3% of full scale. It matters for this project only as an unexplained part of the noise.
+
+![DMA with the CPU asleep: the 400–500 Hz wave is still in the residual](docs/step16-wfi.png)
+
+**Still open, with a narrower field.** It isn't the CPU's activity, the mode, the LA's ground or the SysTick load itself. What's left is outside the CPU: the generator, the USB and ground connections, or mains pickup (400–500 Hz is near the 7th–9th harmonics of 50 or 60 Hz). A next test that removes the generator's sine: set it to a steady DC level of 1.65 V and see if the wave is still in the samples.
+
+### Step 16 summary
+
+**Step 16 tested whether the 400–500 Hz wave comes from the CPU running a loop during the burst. Sleeping the CPU through a whole DMA burst (`WFI`) left it unchanged, and polling showed it too when the background load was off. The CPU is ruled out, and the cause is still unknown.**
+
+**What changed:**
+1. **`DMA_WAIT 1`** (`make WAIT=1`): in DMA mode the CPU sleeps through the burst. DMA2 stream 0's transfer-complete interrupt (number 56, enabled in `NVIC_ISER1`) wakes it. The sleep loop holds interrupts off around the check so a wake-up can't be missed.
+2. **`make LOAD=0`** turns the background load off without editing `main.c`.
+3. **`burst.py`** reports the residual's rms in the 300–600 Hz band.
+
+**Results:**
+
+| Check | Expected | Measured |
+|---|---|---|
+| Sine checks, all runs | as Step 15 | 1999.8–2000.2 Hz, 1982–1992 mVpp |
+| A, polling, no load | 1–2 mV | 4.7–5.2 mV |
+| B, DMA, idle loop, no load | 5–8 mV | 4.6–5.0 mV |
+| C, DMA, CPU asleep | like A if the CPU is the cause | 4.6–5.3 mV, the same as B |
+| A again | like A | 4.9–5.2 mV |
+
+**What you learned along the way:**
+- **A test that can come out either way is worth running.** The prediction for A was wrong, and that disproved the explanation as clearly as C did.
+- **Ranking peaks hides how big they are.** A top-three list said "no 400–500 Hz in polling", when the real change was a different component moving ahead of it. Measuring the band's rms answers the actual question.
+- **Change one thing at a time, and repeat the first run at the end.** A and A again agreed, so nothing drifted during the test.
+- **Sleeping safely:** `cpsid i`, check the flag, `wfi`, then `cpsie i`. A pending interrupt wakes `WFI` even while PRIMASK holds it off, so none can be missed between the check and the sleep.

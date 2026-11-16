@@ -34,6 +34,7 @@ void PendSV_Handler(void)     __attribute__((weak, alias("Default_Handler")));
 void SysTick_Handler(void)    __attribute__((weak, alias("Default_Handler")));
 void ADC_IRQHandler(void)     __attribute__((weak, alias("Default_Handler")));
 void TIM1_CC_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
+void DMA2_Stream0_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
 
 /* The 16 Cortex-M4 entries, then the STM32F429's 91 peripheral interrupts (RM0090 Table 62) */
 __attribute__((section(".isr_vector"), used))
@@ -54,4 +55,5 @@ void (*const vectors[16 + 91])(void) = {
     [16 ... 16 + 90] = Default_Handler,     /* every peripheral interrupt, unless named below */
     [16 + 18] = ADC_IRQHandler,
     [16 + 27] = TIM1_CC_IRQHandler,
+    [16 + 56] = DMA2_Stream0_IRQHandler,
 };

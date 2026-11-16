@@ -56,6 +56,8 @@
 #define SHPR3_SYSTICK (*(volatile uint8_t *)0xE000ED23)          /* SysTick's priority byte */
 #define ADC_IRQ     18                                  /* interrupt numbers, RM0090 Table 62 */
 #define TIM1_CC_IRQ 27
+#define DMA2_S0_IRQ 56
+#define NVIC_ISER1  (*(volatile uint32_t *)0xE000E104)  /* enable bits for interrupts 32-63 */
 #define DMA2_LISR   (*(volatile uint32_t *)0x40026400)
 #define DMA2_LIFCR  (*(volatile uint32_t *)0x40026408)
 #define DMA2_S0CR   (*(volatile uint32_t *)0x40026410)
@@ -76,7 +78,12 @@
 #endif
 #define WINDOW ((NSAMP + 2u) * PERIOD)                  /* idle-count window: the whole burst plus 2 periods */
 
+#ifndef LOAD                                            /* make LOAD=0 overrides this */
 #define LOAD 1                                          /* 1: background SysTick load on, 0: off */
+#endif
+#ifndef DMA_WAIT                                        /* make WAIT=1 overrides this */
+#define DMA_WAIT 0                                      /* MODE 3 only. 0: count idle passes, 1: sleep (WFI) until the DMA is done */
+#endif
 #define SYSTICK_CYCLES 144007u                          /* about 1 kHz; deliberately not a multiple of PERIOD */
 #define LOAD_CYCLES    288u                             /* 2 us of busy work per interrupt */
 #define LATE_LIMIT     100u                             /* a sample more than this many cycles late counts as late */
@@ -135,6 +142,14 @@ void TIM1_CC_IRQHandler(void)
     if (late > LATE_LIMIT) n_late++;
     if (n_started == 1) late_first = late;
     late_last = late;
+}
+
+/* DMA2 stream 0 finished all 1,000 transfers (only enabled with DMA_WAIT 1) */
+volatile uint32_t dma_done;
+void DMA2_Stream0_IRQHandler(void)
+{
+    DMA2_LIFCR = 1u << 5;                               /* clear TCIF0, or the interrupt comes straight back */
+    dma_done = 1;
 }
 
 /* Every finished conversion: collect the result */
@@ -266,6 +281,8 @@ int main(void)
     NVIC_IPR(TIM1_CC_IRQ) = ACQ_PRIO << 4;
     NVIC_IPR(ADC_IRQ)     = ACQ_PRIO << 4;
     NVIC_ISER0 = (1u << TIM1_CC_IRQ) | (1u << ADC_IRQ); /* let both through the NVIC */
+    NVIC_IPR(DMA2_S0_IRQ) = ACQ_PRIO << 4;
+    NVIC_ISER1 = 1u << (DMA2_S0_IRQ - 32);              /* interrupt 56 is bit 24 of the second enable register */
 
     uint32_t next = DWT_CYCCNT, prev_systicks = 0;
     for (;;) {
@@ -308,17 +325,32 @@ int main(void)
             DMA2_S0NDTR = NSAMP;                        /* move 1,000 results */
             DMA2_S0PAR  = (uint32_t)&ADC1_DR;           /* from the ADC's data register */
             DMA2_S0M0AR = (uint32_t)samples;            /* to samples[] */
-            DMA2_S0CR   = (1u << 13) | (1u << 11) | (1u << 10);  /* channel 0 (ADC1), 16 bits each side, step the memory address */
+            DMA2_S0CR   = (1u << 13) | (1u << 11) | (1u << 10)   /* channel 0 (ADC1), 16 bits each side, step the memory address */
+                        | (DMA_WAIT ? 1u << 4 : 0u);    /* TCIE: interrupt when all are done, to wake the CPU */
+            dma_done = 0;
             DMA2_S0CR  |= 1u << 0;                      /* EN: stream on, waiting for requests */
             ADC1_SQR3   = 3;                            /* A0 */
             ADC1_SR     = 0;                            /* clear EOC and OVR */
             ADC1_CR2   |= 1u << 8;                      /* DMA: a request after every conversion */
             ADC1_CR2    = (ADC1_CR2 & ~((0xFu << 24) | (3u << 28))) | (1u << 28);  /* EXTSEL = TIM1_CC1, EXTEN = rising */
+#if DMA_WAIT
+            /* Sleep until the DMA's interrupt. Interrupts are held off (PRIMASK) around the check, so the
+               interrupt can't slip in between "not done yet" and the WFI. A pending interrupt still wakes
+               the CPU from WFI while PRIMASK is set; it then runs as soon as cpsie lets it */
+            __asm volatile ("cpsid i" ::: "memory");
+            while (!dma_done) {
+                __asm volatile ("wfi");
+                __asm volatile ("cpsie i\n\tisb\n\tcpsid i" ::: "memory");
+            }
+            __asm volatile ("cpsie i" ::: "memory");
+            uint32_t ndtr = DMA2_S0NDTR;                /* 0: all 1,000 moved */
+#else
             idle = idle_loop(WINDOW);                   /* the burst runs in hardware meanwhile */
             uint32_t ndtr = DMA2_S0NDTR;                /* results still to come: 0 unless a trigger was skipped */
             uint32_t t_start = DWT_CYCCNT;
             while (!(DMA2_LISR & (1u << 5))             /* TCIF0: should already be set */
                    && DWT_CYCCNT - t_start < NSAMP * PERIOD) {}
+#endif
             ADC1_CR2   &= ~((3u << 28) | (1u << 8));    /* trigger off, DMA off */
             uint32_t dma_err = DMA2_LISR & 0xCu;        /* TEIF0, DMEIF0 */
             DMA2_S0CR  &= ~(1u << 0);                   /* stream off */
@@ -344,7 +376,12 @@ int main(void)
             uart_field(" mode=",    MODE);
             uart_field(" idle_base=", idle_base);
             uart_field(" idle=",    idle);
+#if !(MODE == 3 && DMA_WAIT)                            /* asleep, the CPU counts nothing: no load figure */
             uart_field(" load=",    load);
+#else
+            (void)load;
+            uart_field(" wfi=",     1);
+#endif
 #if MODE == 3
             uart_field(" ndtr=",    ndtr);
             uart_field(" dma_err=", dma_err);

@@ -88,6 +88,10 @@ def main():
         freqs = np.fft.rfftfreq(len(resid), dt)
         top = np.argsort(spec[1:])[::-1][:3] + 1        # skip 0 Hz
         print("residual peaks: " + ", ".join(f"{freqs[i]:.0f} Hz" for i in top))
+        x = np.fft.rfft(resid)                          # no window: the bins' power adds up to the rms
+        band = (freqs >= 300) & (freqs <= 600)
+        band_rms = np.sqrt(2 * np.sum(np.abs(x[band]) ** 2)) / len(resid)
+        print(f"residual 300-600 Hz: {band_rms:.1f} mV rms")
     else:
         print("no sine found (swing under 500 mV or fewer than 2 rising crossings): "
               f"spread {mv.std():.1f} mV rms around the mean")
