@@ -1,4 +1,4 @@
-# ScopeLogic
+# Scope Logic
 
 > Benchmarked polling, interrupt, and DMA-based ADC acquisition in bare-metal C on an STM32F429 (register-level, no HAL); using logic-analyzer GPIO instrumentation and oscilloscope timing measurements, showed DMA cut CPU load from **100%** to **0%**, reduced sampling jitter from **2.5 µs** to **<5 ns**, and raised max sustained sample rate **12×** to **2.4 MSPS**.
 
